@@ -191,7 +191,8 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 - **Spec (source of truth)**: `docs/spec.md` (in this repo; original at `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` kept as backup)
 - **Reference codebase**: `/Users/cevichesmac/Desktop/labcontrol/`
 - **YeKo Studio context**: `/Users/cevichesmac/Desktop/yeko_studio/yeko_studio_context.md`
-- **Bootstrap skill** (once created): `~/.claude/skills/bootstrap-stickerapp-backend/`
+- **Bootstrap skill** (already executed; do not re-run): `~/.claude/skills/bootstrap-stickerapp-backend/`
+- **Next-session briefing**: `NEXT_SESSION.md` at the repo root — read this first when picking the project up
 
 ---
 
