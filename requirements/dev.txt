@@ -1,0 +1,10 @@
+-r base.txt
+pytest>=7.4,<9.0
+pytest-django>=4.7,<5.0
+pytest-cov>=4.1,<6.0
+factory-boy>=3.3,<4.0
+faker>=22.0,<28.0
+ipdb>=0.13,<1.0
+black>=24.0,<26.0
+isort>=5.13,<6.0
+flake8>=7.0,<8.0

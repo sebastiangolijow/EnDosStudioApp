@@ -152,29 +152,43 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 
 ---
 
-## 🚧 Status (project start)
+## 🚧 Status
 
-### Done
+### Done (Milestone 1 — bootstrap + Docker local dev)
 - ✅ Folder created
 - ✅ CLAUDE.md written
-- ⏳ `bootstrap-stickerapp-backend` skill (in progress — see `~/.claude/skills/`)
+- ✅ `bootstrap-stickerapp-backend` skill executed
+- ✅ Django 4.2 + DRF + Postgres 15 skeleton scaffolded (config/, apps/{core,users,orders,payments}/, tests/, templates/emails/, requirements/{base,dev,prod}.txt, Docker, Makefile)
+- ✅ Custom User installed (UUID PK, email USERNAME_FIELD, role admin/shop_staff/customer); `users/0001_initial.py` migration applied
+- ✅ Docker verify green: `manage.py check`, `makemigrations`, `migrate`, `pytest` (3 passed)
+- ✅ Spec moved into `docs/spec.md`
+- ✅ SESSION_START.md archived to `docs/archive/SESSION_START.md`
 
-### Next (after the skill exists)
-- Run the bootstrap skill to lay down the Django project skeleton
-- Move the spec into `docs/spec.md`
-- First real feature: User model + auth flow (mirror LabControl's pattern, adapted for our roles)
+### Bootstrap deviations from the skill (worth knowing)
+- `django-allauth` pinned to **`>=65.0,<66.0`** (skill's original `>=0.57,<0.62` was incompatible with the new `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` settings; the new API actually lands in 65.x)
+- `dj-rest-auth` bumped to **`>=7.0,<8.0`** (compatible with allauth 65.x)
+- `REST_AUTH["TOKEN_MODEL"] = None` added to `config/settings/base.py` (dj-rest-auth 7.x defaults to legacy Token auth; we use JWT only)
+- `whitenoise` moved from `prod.txt` to `base.txt` (settings reference its middleware unconditionally; dev tests need it loadable)
+
+### Next (Milestone 2 — first real feature)
+- Design `Order` + `OrderFile` + (optional) `ReliefMask` models in `apps/orders/`. Read `docs/spec.md` carefully; status lifecycle: `draft → placed → paid → in_production → shipped → delivered → cancelled`. Discuss design with the user before writing code.
+- Write a load-bearing integration test for the registration round-trip: register → set-password → login → GET /api/v1/users/me/. If this passes, the auth foundation is solid.
+- Wire the Stripe checkout flow: `POST /api/v1/orders/{id}/checkout/` → PaymentIntent → webhook → order paid.
+- Then admin views (Django admin first; DRF endpoints for a future Vue admin UI later).
 
 ### TODO (to keep on the radar)
 - Decide email backend for production (SMTP via Gmail / SES / Mailgun?)
 - Decide where uploaded files live in production (local volume to start; S3-compatible if/when storage grows)
 - Stripe webhook signing secret rotation policy
 - Whether the shop owner needs a custom admin UI or Django admin is enough for MVP
+- Add `/api/v1/health/` endpoint (the prod compose healthcheck references it)
+- `STATICFILES_STORAGE` is deprecated in Django 5+; switch to `STORAGES` setting before that bump
 
 ---
 
 ## 📂 Files / paths to know
 
-- **Spec (source of truth)**: `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` (move into repo at first scaffold)
+- **Spec (source of truth)**: `docs/spec.md` (in this repo; original at `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` kept as backup)
 - **Reference codebase**: `/Users/cevichesmac/Desktop/labcontrol/`
 - **YeKo Studio context**: `/Users/cevichesmac/Desktop/yeko_studio/yeko_studio_context.md`
 - **Bootstrap skill** (once created): `~/.claude/skills/bootstrap-stickerapp-backend/`
