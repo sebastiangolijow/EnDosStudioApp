@@ -154,6 +154,9 @@ REST_AUTH = {
     "USE_JWT": True,
     "JWT_AUTH_HTTPONLY": False,
     "TOKEN_MODEL": None,  # JWT only — disable the legacy Token model dj-rest-auth 7.x defaults to
+    # Custom serializer that builds password-reset URLs pointing at the
+    # frontend SPA, not Django admin. See apps/users/password_reset.py.
+    "PASSWORD_RESET_SERIALIZER": "apps.users.password_reset.FrontendPasswordResetSerializer",
 }
 
 # === CORS ===
