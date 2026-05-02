@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: greenfield — no code committed yet. CLAUDE.md is the source of truth until the bootstrap skill runs.
+> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) shipped. Frontend + live Stripe keys are the remaining blockers to a real first transaction.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -40,7 +40,7 @@ A web app where customers upload an image, a frontend editor proposes a die-cut 
 
 The spec leaves a "FUTURE" door open for backend OpenCV-Python only if browser processing proves insufficient. Don't open that door until there's real evidence.
 
-**Source of truth for the spec**: `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` (move it into this repo as `docs/spec.md` once we scaffold).
+**Source of truth for the spec**: `docs/spec.md` (in this repo). The original at `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` is kept as a backup.
 
 ---
 
@@ -155,34 +155,42 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 ## 🚧 Status
 
 ### Done (Milestone 1 — bootstrap + Docker local dev)
-- ✅ Folder created
-- ✅ CLAUDE.md written
-- ✅ `bootstrap-stickerapp-backend` skill executed
-- ✅ Django 4.2 + DRF + Postgres 15 skeleton scaffolded (config/, apps/{core,users,orders,payments}/, tests/, templates/emails/, requirements/{base,dev,prod}.txt, Docker, Makefile)
-- ✅ Custom User installed (UUID PK, email USERNAME_FIELD, role admin/shop_staff/customer); `users/0001_initial.py` migration applied
-- ✅ Docker verify green: `manage.py check`, `makemigrations`, `migrate`, `pytest` (3 passed)
-- ✅ Spec moved into `docs/spec.md`
-- ✅ SESSION_START.md archived to `docs/archive/SESSION_START.md`
+- Django 4.2 + DRF + Postgres 15 skeleton scaffolded; 4 apps (`core`, `users`, `orders`, `payments`); Docker compose; Makefile.
+- Custom User installed (UUID PK, email `USERNAME_FIELD`, role admin/shop_staff/customer); migrated.
+- Spec moved to `docs/spec.md`; `SESSION_START.md` archived.
 
-### Bootstrap deviations from the skill (worth knowing)
-- `django-allauth` pinned to **`>=65.0,<66.0`** (skill's original `>=0.57,<0.62` was incompatible with the new `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` settings; the new API actually lands in 65.x)
-- `dj-rest-auth` bumped to **`>=7.0,<8.0`** (compatible with allauth 65.x)
-- `REST_AUTH["TOKEN_MODEL"] = None` added to `config/settings/base.py` (dj-rest-auth 7.x defaults to legacy Token auth; we use JWT only)
-- `whitenoise` moved from `prod.txt` to `base.txt` (settings reference its middleware unconditionally; dev tests need it loadable)
+### Done (Milestone 2 — orders backend + payment plumbing + auth gate)
+- **Models**: `Order` (full lifecycle + simple_history audit), `OrderFile` (`unique_together(order, kind)`), `PaymentIntent` (PROTECT FK, raw_event JSON). All inherit `apps.core.models.BaseModel`. Migrations applied.
+- **Pricing**: real shop formula wired and gold-standard verified — holográfico 5×5 cm q=50 → 110€ exactly. Constants in `apps/orders/services.py`, bounds (min size, step, quantity) in `apps/orders/models.py` so both layers reference the same source.
+- **Service layer** (`apps/orders/services.py`): `compute_total_cents`, six lifecycle transitions (`place_order`, `transition_to_paid`, `transition_to_in_production`, `transition_to_shipped`, `mark_delivered`, `cancel_order`) with permission/status guards, `select_for_update()` row locks, `simple_history` actor attribution. `InvalidTransition` and `InvalidPricingInput` exceptions translate to 409/400 in views.
+- **Stripe webhook router** (`apps/payments/views.py:StripeWebhookView`): dispatches on `event["type"]`, idempotent on replays, looks up order via `metadata.order_uuid` with fallback to `Order.stripe_payment_intent_id`. `record_payment_intent_event` upserts the local mirror.
+- **Customer/staff API**: `OrderViewSet` (role-scoped queryset, draft-only PATCH guard), per-transition `@action`s (`/place`, `/checkout`, `/cancel`, `/deliver`, `/start-production`, `/ship`), `OrderFileViewSet` for multipart uploads, `PriceQuoteView`. URL surface live at `/api/v1/orders/`.
+- **Stripe checkout flow**: `POST /api/v1/orders/{uuid}/checkout/` creates a Stripe `PaymentIntent`, denormalizes the PI id onto the order, returns `client_secret` for Stripe.js. Mocked in tests; live integration awaits real Stripe keys.
+- **Django admin**: `Order` (with `OrderFile` inline, status/material/lifecycle fieldsets), `OrderFile` standalone, `PaymentIntent` read-only mirror.
+- **Auth roundtrip gate** (`tests/test_auth_roundtrip.py`): full register → set-password → login → /me/ flow, including the explicit `EmailAddress` row check. **Passes** — the auth foundation is solid.
+- **Tests**: 40 passing, 92% coverage. Run with `make test`.
 
-### Next (Milestone 2 — first real feature)
-- Design `Order` + `OrderFile` + (optional) `ReliefMask` models in `apps/orders/`. Read `docs/spec.md` carefully; status lifecycle: `draft → placed → paid → in_production → shipped → delivered → cancelled`. Discuss design with the user before writing code.
-- Write a load-bearing integration test for the registration round-trip: register → set-password → login → GET /api/v1/users/me/. If this passes, the auth foundation is solid.
-- Wire the Stripe checkout flow: `POST /api/v1/orders/{id}/checkout/` → PaymentIntent → webhook → order paid.
-- Then admin views (Django admin first; DRF endpoints for a future Vue admin UI later).
+### Bootstrap deviations from the skill (still in force)
+- `django-allauth` pinned to **`>=65.0,<66.0`** (the modern `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` API only landed in 65.x).
+- `dj-rest-auth` bumped to **`>=7.0,<8.0`** (allauth 65.x compat).
+- `REST_AUTH["TOKEN_MODEL"] = None` added (dj-rest-auth 7.x defaults to legacy Token; we use JWT only).
+- `whitenoise` moved from `prod.txt` to `base.txt` (settings reference its middleware unconditionally; dev tests need it loadable).
 
-### TODO (to keep on the radar)
-- Decide email backend for production (SMTP via Gmail / SES / Mailgun?)
-- Decide where uploaded files live in production (local volume to start; S3-compatible if/when storage grows)
+### Next (Milestone 3 — first real transaction)
+The backend is feature-complete for the MVP loop. What's left to make a real customer flow possible:
+1. **Stripe account + test keys**. Drop `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` into `.env`. End-to-end test with `stripe listen --forward-to localhost:8000/api/v1/payments/webhooks/stripe/`.
+2. **Frontend** (separate repo: `endosstudio_frontend`). Vue 3 + Vite + OpenCV.js editor + Stripe.js integration. The bootstrap skill exists.
+3. **Email backend for verification**. `RegisterView` currently `logger.info`s the verification link instead of sending the email — this has to land before customers can self-register.
+4. **First deploy**. Docker compose prod file already wired; needs hosting choice, domain, TLS, SMTP.
+
+### TODO (longer horizon)
+- Decide email backend for production (Gmail SMTP / SES / Mailgun?)
+- Decide where uploaded files live in production (local volume → S3-compatible when storage grows)
 - Stripe webhook signing secret rotation policy
-- Whether the shop owner needs a custom admin UI or Django admin is enough for MVP
+- Whether shop owner needs a custom admin UI or Django admin is enough for MVP
 - Add `/api/v1/health/` endpoint (the prod compose healthcheck references it)
 - `STATICFILES_STORAGE` is deprecated in Django 5+; switch to `STORAGES` setting before that bump
+- Drawn-relief PNG mask feature (currently scoped out — `with_relief: bool` + free-text note only). Add `relief_mask` to `OrderFile.KIND_CHOICES` when it lands.
 
 ---
 
@@ -192,7 +200,7 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 - **Reference codebase**: `/Users/cevichesmac/Desktop/labcontrol/`
 - **YeKo Studio context**: `/Users/cevichesmac/Desktop/yeko_studio/yeko_studio_context.md`
 - **Bootstrap skill** (already executed; do not re-run): `~/.claude/skills/bootstrap-stickerapp-backend/`
-- **Next-session briefing**: `NEXT_SESSION.md` at the repo root — read this first when picking the project up
+- **Past-session briefings (archive)**: `docs/archive/SESSION_START.md` (M1), `docs/archive/NEXT_SESSION_M2.md` (M2). Read for historical context only — current state lives in this file.
 
 ---
 
