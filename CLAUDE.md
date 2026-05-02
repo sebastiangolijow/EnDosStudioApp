@@ -114,10 +114,16 @@ Uploaded images, masks, results files: `models.FileField` / `models.ImageField`,
 ### Celery
 Don't add Celery + Redis for "future scalability". Add it the moment you have a concrete async need (a webhook handler that takes >2s, an export job, backend image processing). Adding it earlier is overengineering; the prompt says so.
 
-### Tests
+### Tests (backend)
 - All tests inherit from `tests/base.BaseTestCase`.
 - Factory methods on `BaseTestCase`: `create_admin`, `create_shop_staff`, `create_customer`, `create_order`, `authenticate_as_customer`, etc.
 - Run tests via `make test` (always inside Docker — `pytest` directly in venv won't work because deps live in the image).
+
+### Frontend (separate repo: `endosstudio_frontend`)
+- **Stack**: Vue 3 + Vite + TypeScript + Tailwind + Pinia + Vue Router + Axios + OpenCV.js + Stripe.js.
+- **Test runner**: **Playwright** (E2E, real browser). Don't propose Cypress/Vitest/jsdom for UI tests — use Playwright. Unit tests for pure utility functions can use Vitest, but the surface that matters (editor, checkout, auth) is exercised through Playwright specs hitting the real dev server.
+- **Reference UX for auto-crop**: the user has a reference site demonstrating the exact die-cut auto-crop flow they want to replicate. Ask them for the URL when frontend canvas/OpenCV work starts — don't design that component from first principles.
+- **API contract is load-bearing**: this backend uses UUIDs (field name `uuid`, not `id`), money in `total_amount_cents` (integer), status as snake_case strings (`"in_production"`, not camelCase). Frontend must mirror exactly. Payment flow expects the frontend to POST `multipart/form-data` for file uploads under `OrderFile.kind ∈ {original, die_cut_mask}`.
 
 ---
 
