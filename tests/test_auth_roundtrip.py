@@ -10,8 +10,11 @@ If this test breaks, do NOT 'fix' it by mocking around the EmailAddress
 creation — that defeats the whole point. Read SetPasswordView and
 User.verify_email() and find the real divergence.
 """
+from unittest import mock
+
 from allauth.account.models import EmailAddress
 from django.contrib.auth import get_user_model
+from django.core import mail
 from rest_framework.test import APIClient
 
 from tests.base import BaseTestCase
@@ -55,6 +58,15 @@ class AuthRoundtripTests(BaseTestCase):
             EmailAddress.objects.filter(user=user).exists(),
             "EmailAddress row must NOT exist yet — only set-password creates it",
         )
+
+        # 1b. The verification email must have been sent — exactly once,
+        # to this user, with a working /set-password link in the body.
+        self.assertEqual(len(mail.outbox), 1)
+        sent = mail.outbox[0]
+        self.assertEqual(sent.to, [email])
+        self.assertIn(user.verification_token, sent.body, "token must be in the link")
+        self.assertIn("set-password", sent.body)
+        self.assertIn(email, sent.body)
 
         # 2. Login attempt before set-password — must fail (user inactive + no EmailAddress)
         before = client.post(
@@ -148,6 +160,9 @@ class AuthRoundtripTests(BaseTestCase):
         # Pre-create a user
         existing = self.create_customer(email="existing@example.com")
         self.assertTrue(existing.is_active)
+        # Pre-condition: BaseTestCase.create_customer doesn't go through
+        # RegisterView, so no email was sent yet.
+        self.assertEqual(len(mail.outbox), 0)
 
         client = APIClient()
         r = client.post(
@@ -158,6 +173,10 @@ class AuthRoundtripTests(BaseTestCase):
         # Per RegisterView: returns 200 with the same generic message even if
         # the email is already taken — security feature, don't leak account existence.
         self.assertEqual(r.status_code, 200)
+        # No email sent for the duplicate — and crucially, no email sent to
+        # the *existing* user either ("you already have an account" emails
+        # would also leak existence under timing attacks).
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_login_path_uses_email_address_lookup(self):
         # An active user with a working EmailAddress row (the BaseTestCase
@@ -174,3 +193,51 @@ class AuthRoundtripTests(BaseTestCase):
         )
         self.assertEqual(r.status_code, 200, r.data)
         self.assertTrue(r.data.get("access") or r.data.get("access_token"))
+
+
+class VerificationEmailServiceTests(BaseTestCase):
+    """Edge cases for send_verification_email() that aren't easy to trigger
+    through the HTTP layer."""
+
+    def test_smtp_failure_does_not_break_register(self):
+        # Even if SMTP is down, register must still return 200. The customer
+        # should not see a 500; they can hit "resend verification" later
+        # (out of scope for M2 — TODO endpoint).
+        with mock.patch(
+            "apps.users.services.EmailMultiAlternatives.send",
+            side_effect=ConnectionRefusedError("smtp dead"),
+        ):
+            r = APIClient().post(
+                REGISTER_URL,
+                data={"email": "smtpdown@example.com", "password": "Pwd12345!"},
+                format="json",
+            )
+        self.assertEqual(r.status_code, 200)
+        # User exists, just can't be reached
+        user = User.objects.get(email="smtpdown@example.com")
+        self.assertTrue(user.verification_token)
+        # No mail in outbox because send() raised
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_already_verified_user_skipped(self):
+        from apps.users.services import send_verification_email
+        verified = self.create_customer(email="alreadyverified@example.com")
+        self.assertTrue(verified.is_verified)
+        result = send_verification_email(verified)
+        self.assertFalse(result)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_no_token_skipped(self):
+        from apps.users.services import send_verification_email
+        # Build an unverified user without generating a token first
+        user = User.objects.create_user(
+            email="notoken@example.com",
+            password="x" * 12,
+            role="customer",
+            is_active=False,
+            is_verified=False,
+        )
+        self.assertEqual(user.verification_token, "")
+        result = send_verification_email(user)
+        self.assertFalse(result)
+        self.assertEqual(len(mail.outbox), 0)

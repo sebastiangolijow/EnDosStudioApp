@@ -8,6 +8,7 @@ from rest_framework.views import APIView
 from .models import User
 from .permissions import IsAdminOrShopStaff
 from .serializers import RegisterSerializer, SetPasswordSerializer, UserSerializer
+from .services import send_verification_email
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +55,11 @@ class RegisterView(APIView):
             is_verified=False,
         )
         user.generate_verification_token()
-
-        # TODO: queue the verification email here. The Celery task scaffolding
-        # isn't in this skeleton (no Celery on day 1) — for now, log a link
-        # for local development. When SMTP + a real notification path lands,
-        # wire it through apps.users.services or apps.notifications.
-        logger.info(
-            "Registration: user pk=%s — verification link "
-            "/set-password?token=%s&email=%s",
-            user.pk,
-            user.verification_token,
-            user.email,
-        )
+        # Synchronous send. send_verification_email returns False on SMTP
+        # failure but never raises; we deliberately stay returning 200 so
+        # this endpoint can't be used to enumerate accounts via timing or
+        # error-shape differences.
+        send_verification_email(user)
 
         return Response(
             {"detail": "If the email is valid, a setup link was sent."},
