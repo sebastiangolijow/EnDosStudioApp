@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) shipped. Frontend + live Stripe keys are the remaining blockers to a real first transaction.
+> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3 in progress (frontend SPA shipped, cut-path SVG generation, shape field). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -176,6 +176,33 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 - **Auth roundtrip gate** (`tests/test_auth_roundtrip.py`): full register → set-password → login → /me/ flow, including the explicit `EmailAddress` row check. **Passes** — the auth foundation is solid.
 - **Tests**: 40 passing, 92% coverage. Run with `make test`.
 
+### Done (Session 2026-05-03 — cut-path generation + shape field)
+
+Sibling frontend session shipped the editor's Forma step + materials
+overhaul + tight-clip halo. Backend matched it with:
+
+- **`Order.shape`** field. Choices: `contorneado` (default — preserves
+  the existing flow), `cuadrado`, `circulo`, `redondeadas`. Migrated;
+  exposed on both `OrderSerializer` (read) and `OrderUpdateSerializer`
+  (PATCH). Mirrored on `HistoricalOrder` via simple_history.
+- **`OrderFile.kind = "cut_path"`** new slot. The shop's cutter file.
+- **`apps/orders/cut_path.py`** — generates a cutter-friendly SVG per
+  order at `transition_to_paid()` time (after the row lock releases;
+  failure logs but doesn't unwind the paid transition):
+  - `contorneado` → trace `die_cut_mask` PNG alpha contour with a
+    Pillow-only Moore-neighbor walker, emit `<path d="...">`. Falls
+    back to a rectangle if the customer skipped Auto cut.
+  - `cuadrado` → `<rect>`.
+  - `circulo` → `<ellipse>`.
+  - `redondeadas` → `<rect rx=10%×min(W,H)>`.
+  - SVG conventions: viewBox in mm, `stroke="red" stroke-width="0.1"
+    fill="none"` (the de-facto cutter-software convention for "cut
+    here"; no OpenCV-Python dep — the trace is ~50 LOC of Pillow).
+- **Tests**: 7 new in `apps/orders/tests/test_cut_path.py`. Full suite
+  **55/55** passing, **92%** coverage.
+
+Frozen detail of this session: `docs/archive/SESSION_2026_05_03_cut_path.md`.
+
 ### Bootstrap deviations from the skill (still in force)
 - `django-allauth` pinned to **`>=65.0,<66.0`** (the modern `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` API only landed in 65.x).
 - `dj-rest-auth` bumped to **`>=7.0,<8.0`** (allauth 65.x compat).
@@ -183,11 +210,21 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 - `whitenoise` moved from `prod.txt` to `base.txt` (settings reference its middleware unconditionally; dev tests need it loadable).
 
 ### Next (Milestone 3 — first real transaction)
-The backend is feature-complete for the MVP loop. What's left to make a real customer flow possible:
-1. **Stripe account + test keys**. Drop `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` into `.env`. End-to-end test with `stripe listen --forward-to localhost:8000/api/v1/payments/webhooks/stripe/`.
-2. **Frontend** (separate repo: `endosstudio_frontend`). Vue 3 + Vite + OpenCV.js editor + Stripe.js integration. The bootstrap skill exists.
-3. **Email backend for verification**. `RegisterView` currently `logger.info`s the verification link instead of sending the email — this has to land before customers can self-register.
-4. **First deploy**. Docker compose prod file already wired; needs hosting choice, domain, TLS, SMTP.
+The backend + frontend are feature-complete for the MVP loop. The
+remaining blockers are operational:
+
+1. **Stripe account + test keys**. Drop `STRIPE_PUBLISHABLE_KEY`,
+   `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` into `.env`. End-to-end
+   test with
+   `stripe listen --forward-to localhost:8000/api/v1/payments/webhooks/stripe/`.
+   Until then, `POST /api/v1/orders/{uuid}/checkout/` returns 502 and
+   the frontend mocks the Stripe layer in dev.
+2. **Email backend for verification + password reset**. SMTP env vars
+   already wired (`EMAIL_HOST`, `EMAIL_HOST_USER`, ...) but no real
+   provider configured. Pick Gmail SMTP / SES / Mailgun and ship the
+   credentials.
+3. **First deploy**. `docker-compose.prod.yml` is wired; needs a
+   hosting choice, domain, TLS, and the SMTP creds from (2).
 
 ### TODO (longer horizon)
 - Decide email backend for production (Gmail SMTP / SES / Mailgun?)
@@ -197,6 +234,14 @@ The backend is feature-complete for the MVP loop. What's left to make a real cus
 - Add `/api/v1/health/` endpoint (the prod compose healthcheck references it)
 - `STATICFILES_STORAGE` is deprecated in Django 5+; switch to `STORAGES` setting before that bump
 - Drawn-relief PNG mask feature (currently scoped out — `with_relief: bool` + free-text note only). Add `relief_mask` to `OrderFile.KIND_CHOICES` when it lands.
+- **Cutter format**: SVG (universal) ships today. If the shop uses
+  Roland CutStudio / GCC GreatCut and wants the proprietary format
+  directly, add a per-format exporter alongside `build_cut_svg()` in
+  `apps/orders/cut_path.py`.
+- **Admin "regenerate cut path" action**: `apps/orders/admin.py` could
+  expose `generate_cut_path_file(order)` as an admin action so the
+  shop owner can re-run it from the order detail page if the customer
+  changed their mask after payment.
 
 ---
 
@@ -206,7 +251,7 @@ The backend is feature-complete for the MVP loop. What's left to make a real cus
 - **Reference codebase**: `/Users/cevichesmac/Desktop/labcontrol/`
 - **YeKo Studio context**: `/Users/cevichesmac/Desktop/yeko_studio/yeko_studio_context.md`
 - **Bootstrap skill** (already executed; do not re-run): `~/.claude/skills/bootstrap-stickerapp-backend/`
-- **Past-session briefings (archive)**: `docs/archive/SESSION_START.md` (M1), `docs/archive/NEXT_SESSION_M2.md` (M2). Read for historical context only — current state lives in this file.
+- **Past-session briefings (archive)**: `docs/archive/SESSION_START.md` (M1), `docs/archive/NEXT_SESSION_M2.md` (M2), `docs/archive/SESSION_2026_05_03_cut_path.md` (M3 cut-path + shape). Read for historical context only — current state lives in this file.
 
 ---
 
