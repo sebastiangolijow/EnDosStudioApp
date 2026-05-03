@@ -245,6 +245,100 @@ remaining blockers are operational:
 
 ---
 
+## 🧭 Decision log
+
+Open questions where there's a working recommendation but no locked
+choice yet. Update each entry to **Decided (YYYY-MM-DD): X** when the
+call is made; until then it's an open question with the tradeoffs on
+record so we don't relitigate from scratch next time.
+
+> Format: each entry is **Status / Recommendation / Tradeoffs / Trigger
+> to decide**. The recommendation reflects current thinking, not a
+> commitment.
+
+### Email provider for prod (`EMAIL_BACKEND` + SMTP creds)
+
+- **Status**: open. Backend uses SMTP env vars (`EMAIL_HOST`,
+  `EMAIL_HOST_USER`, …) but no real provider configured. `RegisterView`
+  + password reset both depend on this; can't ship customers without it.
+- **Recommendation**: **Gmail SMTP** for M3. Cheapest path to
+  "customers can self-register". `App password` on a yeko@gmail or
+  shop@gmail account. Move to SES or Mailgun once volume goes past
+  ~500 emails/month or deliverability complaints arrive.
+- **Tradeoffs**:
+  - *Gmail*: zero cost, 5-min setup, deliverability is fine for low
+    volume. Daily send cap (~500/day) is the ceiling; bounces are
+    invisible (no webhook).
+  - *SES*: cheap (~$0.10 / 1k emails), proper bounce/complaint
+    webhooks, AWS account overhead.
+  - *Mailgun*: best DX, ~$35/mo for 5k emails, vendor we'd be locked
+    to. Faster setup than SES.
+- **Trigger to decide**: before first deploy.
+
+### Hosting target (backend + frontend)
+
+- **Status**: open. `docker-compose.prod.yml` is wired but unused.
+- **Recommendation**: **backend on a small VPS** (Hetzner CX22 / DO
+  $6 droplet) + **frontend on Vercel or Netlify**. The backend is
+  Docker-native and we already have `docker-compose.prod.yml`; a VPS
+  matches that without a Heroku/Render abstraction tax. Frontend is
+  static (Vite build); managed hosts give automatic HTTPS + previews.
+- **Tradeoffs**:
+  - *VPS for backend*: cheapest, full control, requires nginx/TLS
+    setup once. Bus factor: an admin who knows Linux.
+  - *Render/Railway/Fly for backend*: skip nginx setup, more $/mo,
+    one less moving piece.
+  - *Vercel for frontend*: free tier covers us, GitHub auto-deploy,
+    excellent preview URLs. Locks us to their build settings.
+  - *Self-host frontend behind backend's nginx*: one origin, no CORS
+    headaches, but loses preview deploys + needs the backend's nginx
+    to know how to serve a SPA fallback.
+- **Trigger to decide**: when the deploy task starts. Domain
+  registration can happen in parallel.
+
+### Stripe account owner (yours vs. shop's)
+
+- **Status**: open. Backend has all the Stripe wiring (PaymentIntent
+  creation + webhook receiver) but no real keys. Whoever owns the
+  Stripe account owns the funds.
+- **Recommendation**: **the shop owner registers the Stripe account**;
+  YeKo never touches the keys directly. We get test keys via shared
+  password manager / 1Password share / similar for dev.
+- **Tradeoffs**:
+  - *Shop's account*: clean separation of money. Shop owns the
+    customer relationship. They handle disputes / 1099 / VAT.
+  - *YeKo's account, payouts to shop*: faster start, but YeKo on the
+    hook for chargebacks + tax. Don't do this.
+- **Trigger to decide**: before live keys are needed (i.e., before
+  the first real customer transaction). Test keys can use either
+  account in the meantime.
+
+### Stripe webhook signing secret rotation policy
+
+- **Status**: open. Webhook handler verifies signatures via
+  `STRIPE_WEBHOOK_SECRET` from env. No rotation policy written down.
+- **Recommendation**: rotate annually OR on any suspicion of
+  compromise. Stripe lets us register multiple endpoints with
+  separate secrets, so rotation is non-disruptive: register the new
+  secret as a second endpoint, deploy with the new secret, retire
+  the old endpoint.
+- **Trigger to decide**: optional now. Document properly when we
+  have a real shop running for >6 months (low priority — this is a
+  single-tenant app for one print shop).
+
+### Where uploaded files live in production
+
+- **Status**: open. Currently `models.FileField` writes to local
+  `media/` (Docker volume in prod). Fine until storage grows.
+- **Recommendation**: **stay local through M3**, migrate to
+  S3-compatible (Hetzner Object Storage / DO Spaces / Backblaze B2
+  + django-storages) when total media exceeds ~10 GB or when
+  deploying to multi-instance.
+- **Trigger to decide**: when monthly orders pass ~50/month or
+  total media >5 GB, whichever first.
+
+---
+
 ## 📂 Files / paths to know
 
 - **Spec (source of truth)**: `docs/spec.md` (in this repo; original at `/Users/cevichesmac/Downloads/Guía_StickerApp_Version2 (1).md` kept as backup)
