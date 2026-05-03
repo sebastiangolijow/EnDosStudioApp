@@ -188,7 +188,14 @@ def place_order(order: Order) -> Order:
 
 
 def transition_to_paid(order: Order, *, stripe_event: dict) -> Order:
-    """placed → paid. System action (Stripe webhook); no actor."""
+    """placed → paid. System action (Stripe webhook); no actor.
+
+    Also generates the cut-path SVG so by the time the order hits
+    in_production the printer has both the artwork and the cutter file
+    waiting on it. Failure is logged but doesn't roll back the paid
+    transition — the SVG can be regenerated later from Django admin
+    via a management command.
+    """
     with transaction.atomic():
         order = _lock(order)
         if order.status != "placed":
@@ -197,7 +204,20 @@ def transition_to_paid(order: Order, *, stripe_event: dict) -> Order:
         order.paid_at = timezone.now()
         order._history_user = None  # system action, no human actor
         order.save(update_fields=["status", "paid_at", "updated_at"])
-        return order
+
+    # After the lock releases — file IO outside the row lock keeps the
+    # transaction window short. Failure here doesn't unwind the paid
+    # transition; the order is still paid, the cut SVG just needs a
+    # manual re-run.
+    try:
+        from .cut_path import generate_cut_path_file
+        generate_cut_path_file(order)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to generate cut_path for order %s: %s", order.uuid, exc,
+        )
+    return order
 
 
 def transition_to_in_production(order: Order, *, actor) -> Order:

@@ -58,6 +58,10 @@ MATERIAL_CHOICES = [
 KIND_CHOICES = [
     ("original", _("Original")),
     ("die_cut_mask", _("Die-cut mask")),
+    # SVG generated server-side at place_order time. Path the cutter follows
+    # at the customer's chosen physical size. Format: SVG (universal —
+    # modern cutters + Illustrator + Inkscape all open it).
+    ("cut_path", _("Cut path")),
 ]
 
 # Cut shape — drives the die-cut path generation. `contorneado` follows the
