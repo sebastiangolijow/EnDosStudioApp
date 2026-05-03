@@ -37,6 +37,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "status",
             # Sticker spec
             "material",
+            "shape",
             "width_mm",
             "height_mm",
             "quantity",
@@ -95,6 +96,7 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
         model = Order
         fields = [
             "material",
+            "shape",
             "width_mm",
             "height_mm",
             "quantity",

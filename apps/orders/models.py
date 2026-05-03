@@ -60,6 +60,17 @@ KIND_CHOICES = [
     ("die_cut_mask", _("Die-cut mask")),
 ]
 
+# Cut shape — drives the die-cut path generation. `contorneado` follows the
+# artwork outline (set by the editor); the other three are geometric primitives
+# computed at fulfillment from width_mm × height_mm. Customers picking
+# anything other than `contorneado` skip the editor entirely.
+SHAPE_CHOICES = [
+    ("contorneado", _("Corte contorneado")),
+    ("cuadrado", _("Cuadrado")),
+    ("circulo", _("Círculo")),
+    ("redondeadas", _("Esquinas redondeadas")),
+]
+
 
 class Order(BaseModel):
     """A customer's sticker order. created_by IS the customer (from BaseModel)."""
@@ -79,6 +90,16 @@ class Order(BaseModel):
         choices=MATERIAL_CHOICES,
         blank=True,
         default="",
+    )
+    # Cut shape. Default contorneado matches the existing flow (auto-cut in
+    # the editor). When set to one of the geometric primitives (cuadrado,
+    # circulo, redondeadas) the editor is skipped and the cut path is
+    # computed from width_mm/height_mm at fulfillment time.
+    shape = models.CharField(
+        _("shape"),
+        max_length=20,
+        choices=SHAPE_CHOICES,
+        default="contorneado",
     )
     # Half-cm increments (multiples of 5 mm); validated at place_order time, not on
     # raw save — drafts can hold partial values while the customer is still editing.
