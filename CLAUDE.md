@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3 in progress (frontend SPA shipped, cut-path SVG generation, shape field). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
+> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3 in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -167,7 +167,7 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 
 ### Done (Milestone 2 — orders backend + payment plumbing + auth gate)
 - **Models**: `Order` (full lifecycle + simple_history audit), `OrderFile` (`unique_together(order, kind)`), `PaymentIntent` (PROTECT FK, raw_event JSON). All inherit `apps.core.models.BaseModel`. Migrations applied.
-- **Pricing**: real shop formula wired and gold-standard verified — holográfico 5×5 cm q=50 → 110€ exactly. Constants in `apps/orders/services.py`, bounds (min size, step, quantity) in `apps/orders/models.py` so both layers reference the same source.
+- **Pricing**: real shop formula wired (see "Repricing 2026-05-09" below for the current version). Constants in `apps/orders/services.py`, bounds (min size, step, quantity) in `apps/orders/models.py` so both layers reference the same source.
 - **Service layer** (`apps/orders/services.py`): `compute_total_cents`, six lifecycle transitions (`place_order`, `transition_to_paid`, `transition_to_in_production`, `transition_to_shipped`, `mark_delivered`, `cancel_order`) with permission/status guards, `select_for_update()` row locks, `simple_history` actor attribution. `InvalidTransition` and `InvalidPricingInput` exceptions translate to 409/400 in views.
 - **Stripe webhook router** (`apps/payments/views.py:StripeWebhookView`): dispatches on `event["type"]`, idempotent on replays, looks up order via `metadata.order_uuid` with fallback to `Order.stripe_payment_intent_id`. `record_payment_intent_event` upserts the local mirror.
 - **Customer/staff API**: `OrderViewSet` (role-scoped queryset, draft-only PATCH guard), per-transition `@action`s (`/place`, `/checkout`, `/cancel`, `/deliver`, `/start-production`, `/ship`), `OrderFileViewSet` for multipart uploads, `PriceQuoteView`. URL surface live at `/api/v1/orders/`.
@@ -202,6 +202,49 @@ overhaul + tight-clip halo. Backend matched it with:
   **55/55** passing, **92%** coverage.
 
 Frozen detail of this session: `docs/archive/SESSION_2026_05_03_cut_path.md`.
+
+### Done (Session 2026-05-09 — repricing)
+
+Client locked the real production pricing formula. The previous
+`material_base + (W+H)·1€ + qty·1€ + flat add-ons` model is gone;
+replaced with area-based pricing × quantity × material rate, with
+additive percent add-ons and a 20€ floor:
+
+```
+area_factor      = ((W+15)/1000) × ((H+15)/1000)        # m², bleed-inclusive
+subtotal_eur     = area_factor × qty × material_price
+addon_multiplier = 1 + 0.35·relief + 0.35·tinta_blanca
+                     + 0.20·barniz_brillo + 0.20·barniz_opaco
+total_eur        = max(subtotal_eur × addon_multiplier, 20.00)
+```
+
+Material prices unchanged (45/50/55/60 € — same `MATERIAL_PRICE_CENTS`
+table, renamed from `MATERIAL_BASE_CENTS` for clarity). New per-material
+"price" is now the rate that plugs into the area formula.
+
+Model changes (`migration 0005_repricing_addons`):
+- Removed: `with_design_service`, `with_varnish` (and historical mirrors).
+- Added: `with_tinta_blanca`, `with_barniz_brillo`, `with_barniz_opaco`.
+
+Compute path uses `Decimal` end-to-end (no float drift) and
+`ROUND_HALF_UP` at the cents boundary. Floor applies AFTER add-ons —
+e.g. a 4€ subtotal with relief still floors to 20€, not (4+15)×1.35.
+
+Gold-standard scenarios baked into tests:
+- `vinilo_blanco 10×10cm q=100` (no add-ons) → **5951 cents (59.51€)**
+  — replaces the old `holografico 5×5cm q=50 → 110€` baseline. Picked
+  because it sits comfortably above the floor.
+- `holografico 5×5cm q=50` → **2000 cents (20.00€)** — floor case.
+- `vinilo_blanco 10×10cm q=100 +relief +brillo` → **9224 cents (92.24€)**
+  — exercises additive multiplier (1 + 0.35 + 0.20 = 1.55).
+
+UI note (frontend): the two varnish booleans (`brillo`, `opaco`) are
+mutually exclusive in `OrderConfigView` via radio-group UX (none /
+brillo / opaco). The model layer doesn't enforce mutual exclusion;
+that's a frontend-only constraint. Picking both via a direct API call
+would charge +40% — not a security issue, just a UX one.
+
+Tests: 57 passing (was 55), 92% coverage. Frontend Playwright: 38/38.
 
 ### Bootstrap deviations from the skill (still in force)
 - `django-allauth` pinned to **`>=65.0,<66.0`** (the modern `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` API only landed in 65.x).

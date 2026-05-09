@@ -23,7 +23,14 @@ class OrderAdmin(admin.ModelAdmin):
         "created_by",
         "created_at",
     )
-    list_filter = ("status", "material", "with_relief", "with_varnish", "with_design_service")
+    list_filter = (
+        "status",
+        "material",
+        "with_relief",
+        "with_tinta_blanca",
+        "with_barniz_brillo",
+        "with_barniz_opaco",
+    )
     search_fields = (
         "uuid",
         "recipient_name",
@@ -44,9 +51,9 @@ class OrderAdmin(admin.ModelAdmin):
                 "material",
                 ("width_mm", "height_mm"),
                 "quantity",
-                "with_design_service",
-                "with_varnish",
                 "with_relief",
+                "with_tinta_blanca",
+                ("with_barniz_brillo", "with_barniz_opaco"),
                 "relief_note",
             ),
         }),

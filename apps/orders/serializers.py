@@ -41,9 +41,10 @@ class OrderSerializer(serializers.ModelSerializer):
             "width_mm",
             "height_mm",
             "quantity",
-            "with_design_service",
-            "with_varnish",
             "with_relief",
+            "with_tinta_blanca",
+            "with_barniz_brillo",
+            "with_barniz_opaco",
             "relief_note",
             # Shipping
             "recipient_name",
@@ -100,9 +101,10 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "width_mm",
             "height_mm",
             "quantity",
-            "with_design_service",
-            "with_varnish",
             "with_relief",
+            "with_tinta_blanca",
+            "with_barniz_brillo",
+            "with_barniz_opaco",
             "relief_note",
             "recipient_name",
             "street_line_1",
@@ -120,9 +122,10 @@ class PriceQuoteSerializer(serializers.Serializer):
     width_mm = serializers.IntegerField(min_value=MIN_DIMENSION_MM)
     height_mm = serializers.IntegerField(min_value=MIN_DIMENSION_MM)
     quantity = serializers.IntegerField(min_value=MIN_QUANTITY, max_value=MAX_QUANTITY)
-    with_design_service = serializers.BooleanField(required=False, default=False)
-    with_varnish = serializers.BooleanField(required=False, default=False)
     with_relief = serializers.BooleanField(required=False, default=False)
+    with_tinta_blanca = serializers.BooleanField(required=False, default=False)
+    with_barniz_brillo = serializers.BooleanField(required=False, default=False)
+    with_barniz_opaco = serializers.BooleanField(required=False, default=False)
 
     def validate_width_mm(self, value):
         if value % DIMENSION_STEP_MM != 0:

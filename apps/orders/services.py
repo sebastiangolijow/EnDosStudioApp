@@ -4,26 +4,36 @@ Order business logic.
 Per CLAUDE.md: business logic lives in services.py, not in views/serializers.
 
 This module exposes:
-  - Pricing constants (material base, per-cm, per-sticker, add-on fees)
-  - compute_total_cents() — pure function used by place_order and quote endpoints
+  - Pricing constants (material price, bleed margin, add-on surcharges,
+    minimum-order floor)
+  - compute_total_cents() — pure function used by place_order and quote
+    endpoints
   - 6 lifecycle transitions (place_order, transition_to_paid,
     transition_to_in_production, transition_to_shipped, mark_delivered,
     cancel_order). Each guards the source status; raises InvalidTransition
     on failure (views translate to 409 Conflict).
 
-Pricing formula (sanity-checked against the reference shop's order detail
-for holográfico, 5×5 cm, q=50, no add-ons → 110€):
+Pricing formula (locked with the client on 2026-05-09):
 
-    total_eur = material_base
-              + (width_cm + height_cm) × 1€
-              + quantity × 1€
-              + (8€ if with_varnish)
-              + (8€ if with_design_service)
-              + (12€ if with_relief)
+    area_factor      = ((width_mm + 15) / 1000) × ((height_mm + 15) / 1000)
+                       # area in m², including a 15 mm bleed margin per side
+    subtotal_eur     = area_factor × quantity × material_price_eur
+    addon_multiplier = 1
+                     + (0.35 if with_relief)
+                     + (0.35 if with_tinta_blanca)
+                     + (0.20 if with_barniz_brillo)
+                     + (0.20 if with_barniz_opaco)
+    total_eur        = max(subtotal_eur × addon_multiplier, 20.00)
+
+Add-on surcharges compose ADDITIVELY (sum the percents); the 20€ floor
+applies AFTER add-ons. All math runs in Decimal then casts to integer
+cents at the boundary — no float arithmetic anywhere.
 
 Sizing rules: width_mm and height_mm must be multiples of 5 (half-cm
 allowed) and at least 25 mm (2.5 cm). Quantity must be in [20, 100000].
 """
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.db import transaction
 from django.utils import timezone
 
@@ -37,11 +47,13 @@ from .models import (
 
 
 # ---------------------------------------------------------------------------
-# Pricing constants — confirmed against the reference shop on 2026-05-02
+# Pricing constants — confirmed with the client on 2026-05-09
 # ---------------------------------------------------------------------------
 
-# Material base price (cents). Independent of size/quantity.
-MATERIAL_BASE_CENTS = {
+# Material price (cents). Plugged into the area formula as an "€ per m² per
+# sticker" rate. Same per-material numbers the customer-facing material picker
+# shows (45€, 50€, 55€, 60€).
+MATERIAL_PRICE_CENTS = {
     "vinilo_blanco": 4500,
     "vinilo_transparente": 4500,
     "holografico": 5000,
@@ -53,17 +65,18 @@ MATERIAL_BASE_CENTS = {
     "eggshell_holografico": 6000,
 }
 
-# €1 per cm of (width + height); stored in cents per millimeter so width_mm
-# and height_mm don't need integer cm. (1 cm = 100 cents → 10 cents per mm.)
-SIZE_RATE_CENTS_PER_MM = 10
+# Bleed margin added to BOTH width and height before the area calculation.
+# 15 mm matches the editor's documented bleed (CLAUDE.md §editor).
+BLEED_MARGIN_MM = 15
 
-# €1 per sticker.
-QUANTITY_RATE_CENTS_PER_UNIT = 100
+# Minimum order total — anything below this gets bumped up.
+MIN_TOTAL_CENTS = 2000  # 20.00 €
 
-# Add-on flat fees (cents)
-DESIGN_SERVICE_FEE_CENTS = 800   # "maquetación de archivos"
-VARNISH_FEE_CENTS = 800          # "barniz"
-RELIEF_FEE_CENTS = 1200          # "relieve"
+# Add-on surcharges — additive percent multipliers (1.0 = +100%).
+RELIEF_SURCHARGE_PCT = Decimal("0.35")
+TINTA_BLANCA_SURCHARGE_PCT = Decimal("0.35")
+BARNIZ_BRILLO_SURCHARGE_PCT = Decimal("0.20")
+BARNIZ_OPACO_SURCHARGE_PCT = Decimal("0.20")
 
 ADMIN_ROLES = {"admin", "shop_staff"}
 
@@ -86,16 +99,17 @@ def compute_total_cents(
     width_mm: int,
     height_mm: int,
     quantity: int,
-    with_design_service: bool = False,
-    with_varnish: bool = False,
     with_relief: bool = False,
+    with_tinta_blanca: bool = False,
+    with_barniz_brillo: bool = False,
+    with_barniz_opaco: bool = False,
 ) -> int:
-    """Pure pricing function. All math in integer cents, no floats.
+    """Pure pricing function. Decimal-based math, integer cents at the boundary.
 
     Validates the same constraints place_order enforces: known material,
     width/height multiples of 5 mm and >= 25 mm, quantity in [20, 100000].
     """
-    if material not in MATERIAL_BASE_CENTS:
+    if material not in MATERIAL_PRICE_CENTS:
         raise InvalidPricingInput(f"Unknown material: {material!r}")
     for label, value in (("width_mm", width_mm), ("height_mm", height_mm)):
         if value < MIN_DIMENSION_MM:
@@ -112,16 +126,27 @@ def compute_total_cents(
             f"[{MIN_QUANTITY}, {MAX_QUANTITY}]"
         )
 
-    total = MATERIAL_BASE_CENTS[material]
-    total += (width_mm + height_mm) * SIZE_RATE_CENTS_PER_MM
-    total += quantity * QUANTITY_RATE_CENTS_PER_UNIT
-    if with_design_service:
-        total += DESIGN_SERVICE_FEE_CENTS
-    if with_varnish:
-        total += VARNISH_FEE_CENTS
+    # Area in m² including the 15 mm bleed margin on each side.
+    bleed = Decimal(BLEED_MARGIN_MM)
+    width_m = (Decimal(width_mm) + bleed) / Decimal(1000)
+    height_m = (Decimal(height_mm) + bleed) / Decimal(1000)
+    material_cents = Decimal(MATERIAL_PRICE_CENTS[material])
+
+    subtotal_cents = width_m * height_m * Decimal(quantity) * material_cents
+
+    multiplier = Decimal("1")
     if with_relief:
-        total += RELIEF_FEE_CENTS
-    return total
+        multiplier += RELIEF_SURCHARGE_PCT
+    if with_tinta_blanca:
+        multiplier += TINTA_BLANCA_SURCHARGE_PCT
+    if with_barniz_brillo:
+        multiplier += BARNIZ_BRILLO_SURCHARGE_PCT
+    if with_barniz_opaco:
+        multiplier += BARNIZ_OPACO_SURCHARGE_PCT
+
+    total_cents = subtotal_cents * multiplier
+    total_cents_int = int(total_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return max(total_cents_int, MIN_TOTAL_CENTS)
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +202,10 @@ def place_order(order: Order) -> Order:
             width_mm=order.width_mm,
             height_mm=order.height_mm,
             quantity=order.quantity,
-            with_design_service=order.with_design_service,
-            with_varnish=order.with_varnish,
             with_relief=order.with_relief,
+            with_tinta_blanca=order.with_tinta_blanca,
+            with_barniz_brillo=order.with_barniz_brillo,
+            with_barniz_opaco=order.with_barniz_opaco,
         )
         order.status = "placed"
         order.placed_at = timezone.now()

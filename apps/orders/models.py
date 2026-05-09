@@ -9,9 +9,10 @@ Order lifecycle: draft → placed → paid → in_production → shipped → del
 - delivered / cancelled: customer (owner) transitions
   (cancel only allowed while {draft, placed} — refunds out of scope for M2)
 
-Pricing depends on material × width_mm × height_mm × quantity, plus two
-add-on flags (with_design_service, with_varnish). Mockup rates live in
-apps.orders.services. Real numbers come from the shop owner later.
+Pricing is area-based: ((W+15)/1000) × ((H+15)/1000) × quantity ×
+material_price, with additive percent add-ons (relief +35%, tinta blanca
++35%, barniz brillo +20%, barniz opaco +20%) and a 20€ floor on the final
+total. The full formula + constants live in apps.orders.services.
 """
 import mimetypes
 
@@ -118,10 +119,11 @@ class Order(BaseModel):
         validators=[MinValueValidator(1), MaxValueValidator(MAX_QUANTITY)],
     )
 
-    # Add-ons
-    with_design_service = models.BooleanField(_("with design service"), default=False)
-    with_varnish = models.BooleanField(_("with varnish"), default=False)
+    # Add-ons (percent surcharges, additive — see services.compute_total_cents)
     with_relief = models.BooleanField(_("with relief"), default=False)
+    with_tinta_blanca = models.BooleanField(_("with white ink"), default=False)
+    with_barniz_brillo = models.BooleanField(_("with gloss varnish"), default=False)
+    with_barniz_opaco = models.BooleanField(_("with matte varnish"), default=False)
     relief_note = models.TextField(_("relief note"), blank=True, default="")
 
     # Shipping (single address per order; structured columns, not a separate model)
