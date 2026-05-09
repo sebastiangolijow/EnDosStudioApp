@@ -49,3 +49,14 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+
+# Local dev: rembg's model cache (170 MB ONNX) when running inside the
+# Docker container with a bind-mount. The Dockerfile bakes it into
+# /app/.u2net/ in the IMAGE; the host-side dir under the repo is just
+# a side-effect of the bind-mount and shouldn't be committed.
+.u2net/
+
+# Local dev: pip user-install dir from `docker compose exec web pip
+# install` rescues when a Dockerfile rebuild fails (see CLAUDE.md).
+# Ephemeral — disappears on `docker compose down`; never committed.
+.local/

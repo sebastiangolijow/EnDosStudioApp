@@ -10,3 +10,14 @@ psycopg2-binary>=2.9,<3.0
 stripe>=7.0,<9.0
 Pillow>=10.0,<11.0
 whitenoise>=6.6,<7.0
+
+# AI background-removal for the editor's "Recorte inteligente" feature.
+# Extras:
+#   [isnet] — pulls the isnet-general-use model dependency; the ONNX file
+#            itself (~170 MB) is downloaded at Docker build time (see
+#            Dockerfile) and baked into /app/.u2net so prod containers
+#            cold-start without hitting GitHub Releases at runtime.
+#   [cpu]   — pulls onnxruntime (CPU build). Required: rembg 2.0.7+ split
+#            the runtime out of the base package; without [cpu] (or [gpu])
+#            calling new_session() raises "No onnxruntime backend found".
+rembg[isnet,cpu]>=2.0,<3.0

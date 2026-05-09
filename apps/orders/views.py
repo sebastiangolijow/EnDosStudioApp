@@ -20,6 +20,8 @@ Endpoint surface:
   POST   /api/v1/orders/{uuid}/files/     upload OrderFile (multipart)
   DELETE /api/v1/orders/{uuid}/files/{file_uuid}/  remove OrderFile
 
+  POST   /api/v1/orders/{uuid}/smart-cut/ AI background-removal cut polygon
+
   GET    /api/v1/orders/quote/            price preview, no order needed
 """
 import logging
@@ -52,6 +54,11 @@ from .services import (
     place_order,
     transition_to_in_production,
     transition_to_shipped,
+)
+from .services_smart_cut import (
+    NoOriginalFile,
+    SmartCutModelUnavailable,
+    smart_cut_for_order,
 )
 
 logger = logging.getLogger(__name__)
@@ -241,6 +248,33 @@ class OrderViewSet(viewsets.ModelViewSet):
         except InvalidTransition as e:
             return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(order).data)
+
+    @action(detail=True, methods=["post"], url_path="smart-cut")
+    def smart_cut(self, request, pk=None):
+        """Run AI background removal on the order's `original` image.
+
+        Returns a polygon the editor can pass to `setMask`. Sync, blocking
+        (~2-4 s on CPU); see services_smart_cut.smart_cut_for_order. Allowed
+        on any status — read-only, doesn't mutate the order. Ownership is
+        enforced via `get_queryset` (customers see only their own orders).
+        """
+        order = self.get_object()
+        try:
+            result = smart_cut_for_order(order)
+        except NoOriginalFile:
+            return Response(
+                {"detail": "No original file uploaded."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except SmartCutModelUnavailable as exc:
+            logger.exception(
+                "Smart-cut model unavailable for order %s", order.pk,
+            )
+            return Response(
+                {"detail": f"Smart cut unavailable: {exc}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class OrderFileViewSet(viewsets.ModelViewSet):

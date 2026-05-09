@@ -55,45 +55,50 @@ logger = logging.getLogger(__name__)
 _MIN_CONTOUR_FRACTION = 0.005
 
 
-def _alpha_to_path(mask_pil: Image.Image, width_mm: int, height_mm: int) -> str | None:
-    """Trace the alpha channel of a PNG mask into an SVG path.
+def _walk_alpha_contour(mask_pil: Image.Image) -> list[tuple[int, int]] | None:
+    """Walk the outer boundary of an alpha mask and return pixel-coordinate points.
 
-    The mask is a binary silhouette: pixels with alpha > 128 are "inside the
-    cut", everything else is "outside". We walk the boundary using a simple
-    marching-squares-style scan, then map the pixel coordinates to mm via
-    the customer's chosen physical dimensions.
+    Input: a PIL image (RGBA or single-channel binary). "Inside" = alpha > 128
+    for RGBA inputs, or value > 0 for single-channel binary inputs. Output:
+    one list of (x, y) tuples per pixel along the boundary, in walk order.
 
-    Returns an SVG `d` attribute value, or None if the mask is empty / has
-    no usable contour.
+    Returns None if the mask is empty / has no usable contour.
+
+    Why this exists separately:
+      - apps.orders.cut_path._alpha_to_path uses it to build the printer-
+        facing SVG (mm-scaled, simplified to ~200 points).
+      - apps.orders.services_smart_cut uses it to extract the contour from
+        a rembg AI mask (full pixel density, no simplification).
+      - Both callers want the raw pixel polygon; only the post-processing
+        differs. Sharing this routine means the proven Moore tracer isn't
+        duplicated.
+
+    Implementation: scan to find the first "inside" pixel, then 8-connected
+    Moore-neighbor tracing clockwise. Stops when the walker returns to the
+    start. OpenCV's findContours would do this in one call, but adding the
+    OpenCV-Python dep just for one tracer is more than we need for the
+    relatively simple shapes the editor produces (one outer contour per
+    sticker after dilation/segmentation).
     """
-    if mask_pil.mode != "RGBA":
-        mask_pil = mask_pil.convert("RGBA")
+    if mask_pil.mode == "RGBA":
+        # Reduce to alpha channel + threshold.
+        binary = mask_pil.split()[3].point(lambda v: 255 if v > 128 else 0)
+    elif mask_pil.mode == "L":
+        binary = mask_pil.point(lambda v: 255 if v > 0 else 0)
+    elif mask_pil.mode == "1":
+        binary = mask_pil.convert("L")
+    else:
+        binary = mask_pil.convert("RGBA").split()[3].point(
+            lambda v: 255 if v > 128 else 0,
+        )
 
-    px_w, px_h = mask_pil.size
+    px_w, px_h = binary.size
     if px_w == 0 or px_h == 0:
         return None
-
-    # Build a binary alpha grid (1 = inside).
-    alpha = mask_pil.split()[3]
-    binary = alpha.point(lambda v: 255 if v > 128 else 0)
-    px = binary.load()
-
-    # Quick bbox check — skip empty masks.
-    bbox = binary.getbbox()
-    if bbox is None:
+    if binary.getbbox() is None:
         return None
 
-    # Trace the OUTER boundary using a flood-fill-from-the-outside trick:
-    # any pixel reachable from the canvas border by walking through "outside"
-    # pixels is "outside"; the rest is "inside". The outer boundary is the
-    # set of inside pixels adjacent to outside pixels. We then walk that
-    # boundary in order using Moore-neighbor tracing.
-    #
-    # OpenCV would give us this in one call (cv.findContours), but we don't
-    # want to add a heavyweight dep just for this — Pillow + a small custom
-    # tracer is enough for the relatively simple shapes the editor produces
-    # (one outer contour per sticker, after the dilate step).
-
+    px = binary.load()
     inside_at = lambda x, y: 0 <= x < px_w and 0 <= y < px_h and px[x, y] > 0  # noqa: E731
 
     # Find a starting boundary pixel: scan top-left to bottom-right, take
@@ -141,16 +146,36 @@ def _alpha_to_path(mask_pil: Image.Image, width_mm: int, height_mm: int) -> str 
                 found = True
                 break
         if not found:
-            # Isolated pixel — emit a tiny dot (rare; binary mask thresholds
-            # should have removed speckle by now).
+            # Isolated pixel — rare; binary mask thresholds should have
+            # removed speckle by now.
             break
-        # Standard termination: back to start AND came in from the same
-        # direction we left it.
+        # Standard termination: back to start.
         if cur == start and len(boundary) > 2:
             boundary.pop()  # drop the duplicate
             break
 
     if len(boundary) < 3:
+        return None
+    return boundary
+
+
+def _alpha_to_path(mask_pil: Image.Image, width_mm: int, height_mm: int) -> str | None:
+    """Trace the alpha channel of a PNG mask into an SVG path.
+
+    Returns an SVG `d` attribute value (mm-scaled, simplified to ~200
+    points), or None if the mask is empty / has no usable contour. Uses
+    `_walk_alpha_contour` for the actual tracing — see that function for
+    the algorithm.
+    """
+    if mask_pil.mode != "RGBA":
+        mask_pil = mask_pil.convert("RGBA")
+
+    px_w, px_h = mask_pil.size
+    if px_w == 0 or px_h == 0:
+        return None
+
+    boundary = _walk_alpha_contour(mask_pil)
+    if boundary is None:
         return None
 
     # Simplify the polygon — Moore tracing emits one point per pixel which

@@ -24,8 +24,18 @@ ARG REQUIREMENTS=dev
 COPY requirements/ requirements/
 RUN pip install -r requirements/${REQUIREMENTS}.txt
 
+# Bake the rembg ONNX model into the image so cold-starts in prod don't
+# block 5-10 s downloading from GitHub Releases. Runs as root, then we
+# move the cache to a path the non-root `app` user can read. Adds
+# ~170 MB to the image; controlled, deterministic, no rate-limit risk.
+RUN python -c "from rembg import new_session; new_session('isnet-general-use')" \
+ && mkdir -p /app/.u2net \
+ && cp -r /root/.u2net/. /app/.u2net/
+ENV U2NET_HOME=/app/.u2net
+
 # Non-root runtime user
-RUN groupadd -r app && useradd -r -g app -d /app app
+RUN groupadd -r app && useradd -r -g app -d /app app \
+ && chown -R app:app /app/.u2net
 
 COPY --chown=app:app . .
 
