@@ -76,9 +76,36 @@ SHAPE_CHOICES = [
     ("redondeadas", _("Esquinas redondeadas")),
 ]
 
+# Order kinds — discriminator between custom-sticker orders and catalog
+# product orders. "sticker" is the M2 default and preserves existing
+# behavior; "catalog" is M3a (a single non-sticker product per order,
+# skips the editor / cut-path / pricing formula). Mixed cart is M3b.
+# Named ORDER_KIND_* (not KIND_*) to avoid colliding with the existing
+# KIND_CHOICES used by OrderFile.
+KIND_STICKER = "sticker"
+KIND_CATALOG = "catalog"
+ORDER_KIND_CHOICES = [
+    (KIND_STICKER, _("Sticker (custom)")),
+    (KIND_CATALOG, _("Catalog product")),
+]
+
 
 class Order(BaseModel):
-    """A customer's sticker order. created_by IS the customer (from BaseModel)."""
+    """A customer's order. created_by IS the customer (from BaseModel).
+
+    `kind` distinguishes a custom-sticker order from a catalog product
+    order. Sticker fields (material, dimensions, etc.) are only valid
+    when kind=sticker; product/product_quantity are only valid when
+    kind=catalog. The XOR is enforced in clean().
+    """
+
+    kind = models.CharField(
+        _("kind"),
+        max_length=16,
+        choices=ORDER_KIND_CHOICES,
+        default=KIND_STICKER,
+        db_index=True,
+    )
 
     status = models.CharField(
         _("status"),
@@ -126,6 +153,19 @@ class Order(BaseModel):
     with_barniz_opaco = models.BooleanField(_("with matte varnish"), default=False)
     relief_note = models.TextField(_("relief note"), blank=True, default="")
 
+    # Catalog (kind=catalog only). PROTECT prevents deleting a product that
+    # has any orders attached — preserves history. Owners hide a product
+    # via Product.is_active=False instead.
+    product = models.ForeignKey(
+        "products.Product",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="orders",
+        verbose_name=_("product"),
+    )
+    product_quantity = models.PositiveIntegerField(_("product quantity"), default=0)
+
     # Shipping (single address per order; structured columns, not a separate model)
     recipient_name = models.CharField(_("recipient name"), max_length=120, blank=True, default="")
     street_line_1 = models.CharField(_("street line 1"), max_length=255, blank=True, default="")
@@ -168,7 +208,31 @@ class Order(BaseModel):
         ]
 
     def __str__(self):
-        return f"Order {self.pk} ({self.status})"
+        return f"Order {self.pk} ({self.kind}, {self.status})"
+
+    def clean(self):
+        """Enforce kind XOR.
+
+        Sticker orders may NOT carry a product; catalog orders MUST carry
+        a product + product_quantity >= 1, and the sticker spec fields are
+        ignored. Field-level required-ness is handled by place_order so a
+        draft can still be saved with partial data while the customer
+        edits.
+        """
+        super().clean()
+        errors = {}
+        if self.kind == KIND_STICKER:
+            if self.product_id is not None:
+                errors["product"] = "Sticker orders must not reference a catalog product."
+            if self.product_quantity:
+                errors["product_quantity"] = "Sticker orders must not set product_quantity."
+        elif self.kind == KIND_CATALOG:
+            if self.product_id is None:
+                errors["product"] = "Catalog orders require a product."
+            if self.product_quantity is None or self.product_quantity < 1:
+                errors["product_quantity"] = "Catalog orders require product_quantity >= 1."
+        if errors:
+            raise ValidationError(errors)
 
 
 def order_file_upload_path(instance, filename):

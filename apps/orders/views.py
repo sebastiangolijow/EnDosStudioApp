@@ -37,6 +37,7 @@ from apps.payments.services import StripeService
 from .models import Order, OrderFile
 from .serializers import (
     CheckoutResponseSerializer,
+    OrderCreateSerializer,
     OrderFileSerializer,
     OrderSerializer,
     OrderUpdateSerializer,
@@ -81,14 +82,32 @@ class OrderViewSet(viewsets.ModelViewSet):
         return qs.filter(created_by=self.request.user)
 
     def get_serializer_class(self):
+        if self.action == "create":
+            return OrderCreateSerializer
         if self.action in {"update", "partial_update"}:
             return OrderUpdateSerializer
         return OrderSerializer
 
     def perform_create(self, serializer):
-        # Customer creates empty drafts; staff creating orders for someone else
-        # is out of scope for M2.
+        # Customer creates either an empty sticker draft or a catalog
+        # draft with product+qty already set; staff creating orders for
+        # someone else is out of scope for M3a.
         serializer.save(created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        """Override to return the full OrderSerializer shape after create.
+
+        OrderCreateSerializer takes minimal input (kind/product/qty); the
+        frontend wants the full Order back so it can route to checkout.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        order = serializer.instance
+        return Response(
+            OrderSerializer(order).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def update(self, request, *args, **kwargs):
         order = self.get_object()
@@ -135,6 +154,24 @@ class OrderViewSet(viewsets.ModelViewSet):
                 {"detail": "Order total is zero; cannot create payment intent."},
                 status=status.HTTP_409_CONFLICT,
             )
+
+        # Catalog re-check: customer placed the order; stock may have moved
+        # since. Reject before charging Stripe (cleaner than processing a
+        # refund). The race-safe decrement still happens in transition_to_paid.
+        from .models import KIND_CATALOG
+        if order.kind == KIND_CATALOG and order.product_id is not None:
+            order.product.refresh_from_db()
+            if order.product.stock_quantity < order.product_quantity:
+                return Response(
+                    {
+                        "detail": "insufficient_stock",
+                        "message": (
+                            f"Only {order.product.stock_quantity} unit(s) of "
+                            f"'{order.product.name}' remain in stock."
+                        ),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         try:
             intent = StripeService().create_payment_intent(

@@ -8,8 +8,12 @@ status=draft, created_by=request.user — set in the view).
 """
 from rest_framework import serializers
 
+from apps.products.models import Product
+
 from .models import (
     DIMENSION_STEP_MM,
+    KIND_CATALOG,
+    KIND_STICKER,
     MATERIAL_CHOICES,
     MAX_QUANTITY,
     MIN_DIMENSION_MM,
@@ -26,16 +30,35 @@ class OrderFileSerializer(serializers.ModelSerializer):
         read_only_fields = ["uuid", "mime_type", "size_bytes", "created_at"]
 
 
+class ProductRefSerializer(serializers.ModelSerializer):
+    """Tiny embed of a Product on Order.product_detail.
+
+    Just enough for the frontend to render the catalog summary without a
+    second fetch.
+    """
+
+    price_eur = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = ["uuid", "name", "slug", "image", "price_cents", "price_eur"]
+
+    def get_price_eur(self, obj) -> str:
+        return f"{obj.price_cents / 100:.2f}"
+
+
 class OrderSerializer(serializers.ModelSerializer):
     files = OrderFileSerializer(many=True, read_only=True)
     total_eur = serializers.SerializerMethodField()
+    product_detail = ProductRefSerializer(source="product", read_only=True)
 
     class Meta:
         model = Order
         fields = [
             "uuid",
+            "kind",
             "status",
-            # Sticker spec
+            # Sticker spec (kind=sticker)
             "material",
             "shape",
             "width_mm",
@@ -46,6 +69,10 @@ class OrderSerializer(serializers.ModelSerializer):
             "with_barniz_brillo",
             "with_barniz_opaco",
             "relief_note",
+            # Catalog (kind=catalog)
+            "product",
+            "product_quantity",
+            "product_detail",
             # Shipping
             "recipient_name",
             "street_line_1",
@@ -77,6 +104,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "currency",
             "stripe_payment_intent_id",
             "files",
+            "product_detail",
             "created_at",
             "updated_at",
             "placed_at",
@@ -91,11 +119,19 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class OrderUpdateSerializer(serializers.ModelSerializer):
-    """PATCH serializer — only fields the customer edits while draft."""
+    """PATCH serializer — only fields the customer edits while draft.
+
+    Sticker spec fields are not required at the serializer level (a draft
+    can be partial); place_order enforces them at the lifecycle boundary.
+    Same for catalog fields. Order.clean() (XOR) runs as part of model
+    validation when full_clean() is invoked.
+    """
 
     class Meta:
         model = Order
         fields = [
+            "kind",
+            # Sticker spec
             "material",
             "shape",
             "width_mm",
@@ -106,6 +142,10 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "with_barniz_brillo",
             "with_barniz_opaco",
             "relief_note",
+            # Catalog
+            "product",
+            "product_quantity",
+            # Shipping
             "recipient_name",
             "street_line_1",
             "street_line_2",
@@ -113,6 +153,71 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "postal_code",
             "country",
         ]
+        extra_kwargs = {
+            "kind": {"required": False},
+            "material": {"required": False},
+            "shape": {"required": False},
+            "width_mm": {"required": False},
+            "height_mm": {"required": False},
+            "quantity": {"required": False},
+            "product": {"required": False, "allow_null": True},
+            "product_quantity": {"required": False},
+        }
+
+    def validate(self, attrs):
+        """Run the model's clean() to enforce the kind XOR.
+
+        Without this, a customer could PATCH a sticker order with a
+        catalog product attached (or vice-versa) — clean() catches that.
+        """
+        instance = self.instance
+        if instance is None:
+            return attrs
+        # Build a temp Order with patch applied; run full_clean for XOR.
+        for field, value in attrs.items():
+            setattr(instance, field, value)
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            instance.clean()
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(e.message_dict)
+        return attrs
+
+
+class OrderCreateSerializer(serializers.ModelSerializer):
+    """POST serializer for creating drafts.
+
+    Customer can either create an empty sticker draft (default kind, all
+    fields blank) or a catalog draft with product + product_quantity set
+    up front. Shipping is filled at checkout. clean() XOR is enforced
+    via validate().
+    """
+
+    class Meta:
+        model = Order
+        fields = ["kind", "product", "product_quantity"]
+        extra_kwargs = {
+            "kind": {"required": False},
+            "product": {"required": False, "allow_null": True},
+            "product_quantity": {"required": False},
+        }
+
+    def validate(self, attrs):
+        kind = attrs.get("kind", KIND_STICKER)
+        if kind == KIND_CATALOG:
+            if not attrs.get("product"):
+                raise serializers.ValidationError({"product": "Required for catalog orders."})
+            if attrs.get("product_quantity", 0) < 1:
+                raise serializers.ValidationError(
+                    {"product_quantity": "Must be >= 1 for catalog orders."}
+                )
+        else:
+            # sticker — reject any product/quantity sneaked in
+            if attrs.get("product"):
+                raise serializers.ValidationError(
+                    {"product": "Sticker orders must not reference a product."}
+                )
+        return attrs
 
 
 class PriceQuoteSerializer(serializers.Serializer):

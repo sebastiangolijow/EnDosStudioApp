@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3 in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
+> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3a in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor, **catalog products + Order.kind 2026-05-09**). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -149,7 +149,9 @@ apps/
 ├── core/         # BaseModel mixins, permissions, custom managers, common utils
 ├── users/        # User model, auth flows, registration, email verification
 ├── orders/       # Order model, OrderFile (uploads), order status transitions, services
-└── payments/     # Stripe integration: PaymentIntent, webhooks, payment records
+├── payments/     # Stripe integration: PaymentIntent, webhooks, payment records
+└── products/     # Catalog products (M3a). Llaveros etc. — non-sticker items
+                  # bought via catalog Orders (Order.kind="catalog").
 ```
 
 No `notifications/` app on day 1 — Django's `send_mail` straight from a service is enough. Add an app when there's a real notification surface (templates, scheduling, multi-channel).
@@ -245,6 +247,78 @@ that's a frontend-only constraint. Picking both via a direct API call
 would charge +40% — not a security issue, just a UX one.
 
 Tests: 57 passing (was 55), 92% coverage. Frontend Playwright: 38/38.
+
+### Done (Session 2026-05-09 — catalog + Order.kind, M3a)
+
+The shop sells more than custom stickers — llaveros and similar fixed
+SKUs. Rather than refactor the whole `Order` table to support mixed
+carts (sticker + product in one order, that's M3b), M3a ships catalog
+products as their own orders with a discriminator field.
+
+**New app: `apps.products`** — `Product(BaseModel)` with `name`, `slug`
+(auto-generated, unique), `description`, `price_cents`, `stock_quantity`,
+`image` (ImageField), `is_active`, simple_history mirror. Public list +
+retrieve via `/api/v1/products/` (no auth needed, drives signups via the
+buy flow); staff CRUD gated by `IsAdminOrShopStaff`.
+
+**Order.kind discriminator** (`apps/orders/models.py`):
+- `"sticker"` (default — all M2 behavior unchanged)
+- `"catalog"` (new — single Product + product_quantity; sticker spec
+  fields are null/zero)
+- `clean()` enforces the XOR (sticker orders cannot carry a product;
+  catalog orders cannot set sticker spec fields)
+
+Migration `0006_order_kind_product` adds three columns to `Order`:
+`kind`, `product` (PROTECT FK to products.Product), `product_quantity`.
+All defaults are backfill-safe (existing orders default to
+`kind="sticker"` and continue to work without changes).
+
+**Service-layer branching** in `apps/orders/services.py`:
+- `compute_total_cents` → branch on order.kind. Catalog =
+  `product.price_cents × product_quantity`. Sticker = unchanged.
+- `place_order` → `_validate_sticker_required` vs
+  `_validate_catalog_required`. Catalog requires product set, qty ≥ 1,
+  `product.is_active`, and `stock_quantity >= product_quantity` (initial
+  check). Shipping required for both kinds.
+- `transition_to_paid` → for catalog orders, locks the Product row with
+  `select_for_update()` and decrements `stock_quantity`. Cut-path SVG
+  generation only runs for sticker kind. If stock dropped under the
+  paid order at this point (race), the oversell is logged but allowed —
+  the SMB-correct tradeoff (shop reconciles).
+
+**Checkout stock re-check** (`OrderViewSet.checkout` action): catalog
+orders re-fetch `product.stock_quantity` before creating the Stripe
+PaymentIntent and return HTTP 409 with `{"detail":
+"insufficient_stock"}` if short. Cleaner than refunding a charged card.
+
+**Cancel-after-paid intentionally NOT implemented for catalog**: the M2
+contract is "no self-service refund after paid; admin handles via
+Stripe dashboard." Same rule for catalog; if/when the shop refunds, a
+future `charge.refunded` webhook handler or admin "Re-credit stock"
+action will restore inventory.
+
+**Order serializer + admin updated**: nested `product_detail`
+(ProductRefSerializer subset: name, slug, image, price_cents) is
+included in `OrderSerializer` so the frontend renders the catalog
+summary without a second API call. `OrderAdmin.get_fieldsets()` returns
+the "Sticker spec" or "Catalog item" fieldset based on `obj.kind`. New
+`POST /api/v1/orders/` accepts `{kind: "catalog", product: <uuid>,
+product_quantity: <n>}` for catalog draft creation.
+
+**Tests**: 17 new (`test_product_api.py` + `test_product_admin_api.py` +
+`test_models.py` for the kind XOR + `test_catalog_lifecycle.py` for
+place/paid/checkout). Sticker regression suite stays untouched and
+green. **93 passing total, 93% coverage.**
+
+**Frontend mirror**: `OrderKind`, `Product`, `ProductRef` types added.
+New views `/catalogo`, `/catalogo/:slug`, `/admin/products`,
+`/admin/products/new`, `/admin/products/:slug/edit`. CheckoutView /
+ConfirmationView / DashboardView / OrderHistoryCard branch on
+`order.kind` for kind-aware rendering.
+
+**Deferred to M3b**: `OrderItem` table; mixed cart; refund-driven stock
+re-credit; product variants; image gallery; stock reservation on
+placement; categories/search/filters; discount codes.
 
 ### Bootstrap deviations from the skill (still in force)
 - `django-allauth` pinned to **`>=65.0,<66.0`** (the modern `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` API only landed in 65.x).

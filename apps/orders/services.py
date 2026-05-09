@@ -39,6 +39,8 @@ from django.utils import timezone
 
 from .models import (
     DIMENSION_STEP_MM,
+    KIND_CATALOG,
+    KIND_STICKER,
     MAX_QUANTITY,
     MIN_DIMENSION_MM,
     MIN_QUANTITY,
@@ -172,41 +174,89 @@ def _require_staff(actor) -> None:
 # Transitions
 # ---------------------------------------------------------------------------
 
+def _validate_sticker_required(order: Order) -> list[str]:
+    """Field-level requirements for a sticker order at place_order time."""
+    missing = []
+    if not order.material:
+        missing.append("material")
+    if order.width_mm < MIN_DIMENSION_MM or order.width_mm % DIMENSION_STEP_MM != 0:
+        missing.append("width_mm")
+    if order.height_mm < MIN_DIMENSION_MM or order.height_mm % DIMENSION_STEP_MM != 0:
+        missing.append("height_mm")
+    if order.quantity < MIN_QUANTITY or order.quantity > MAX_QUANTITY:
+        missing.append("quantity")
+    if not order.files.filter(kind="original").exists():
+        missing.append("file:original")
+    return missing
+
+
+def _validate_catalog_required(order: Order) -> list[str]:
+    """Field-level requirements for a catalog order at place_order time.
+
+    Includes an initial stock check; checkout re-checks just before Stripe
+    PaymentIntent creation (race-safe path is in transition_to_paid).
+    """
+    missing = []
+    if order.product_id is None:
+        missing.append("product")
+        return missing  # nothing else makes sense without a product
+    if order.product_quantity < 1:
+        missing.append("product_quantity")
+    if not order.product.is_active:
+        missing.append("product:inactive")
+    if order.product.stock_quantity < order.product_quantity:
+        missing.append("product:insufficient_stock")
+    return missing
+
+
+def _compute_catalog_total_cents(order: Order) -> int:
+    """price_cents × product_quantity. Read price from the linked Product."""
+    return order.product.price_cents * order.product_quantity
+
+
 def place_order(order: Order) -> Order:
-    """draft → placed. Validates required fields, enforces size/quantity rules,
-    computes the total."""
+    """draft → placed. Validates required fields and computes the total.
+
+    Branches on order.kind:
+      - sticker: existing M2 spec/dimension/quantity/file checks; pricing
+        via the area×qty×material formula.
+      - catalog: product must be set, active, and have sufficient stock;
+        pricing is price_cents × product_quantity.
+
+    Common: shipping fields are always required.
+    """
     with transaction.atomic():
         order = _lock(order)
         if order.status != "draft":
             raise InvalidTransition(f"Cannot place order in status {order.status!r}.")
 
-        missing = []
-        if not order.material:
-            missing.append("material")
-        if order.width_mm < MIN_DIMENSION_MM or order.width_mm % DIMENSION_STEP_MM != 0:
-            missing.append("width_mm")
-        if order.height_mm < MIN_DIMENSION_MM or order.height_mm % DIMENSION_STEP_MM != 0:
-            missing.append("height_mm")
-        if order.quantity < MIN_QUANTITY or order.quantity > MAX_QUANTITY:
-            missing.append("quantity")
+        if order.kind == KIND_STICKER:
+            missing = _validate_sticker_required(order)
+        elif order.kind == KIND_CATALOG:
+            missing = _validate_catalog_required(order)
+        else:
+            raise InvalidTransition(f"Unknown order kind {order.kind!r}.")
+
         for field in ("recipient_name", "street_line_1", "city", "postal_code", "country"):
             if not getattr(order, field):
                 missing.append(field)
-        if not order.files.filter(kind="original").exists():
-            missing.append("file:original")
         if missing:
             raise InvalidTransition(f"Cannot place order; missing: {', '.join(missing)}.")
 
-        order.total_amount_cents = compute_total_cents(
-            material=order.material,
-            width_mm=order.width_mm,
-            height_mm=order.height_mm,
-            quantity=order.quantity,
-            with_relief=order.with_relief,
-            with_tinta_blanca=order.with_tinta_blanca,
-            with_barniz_brillo=order.with_barniz_brillo,
-            with_barniz_opaco=order.with_barniz_opaco,
-        )
+        if order.kind == KIND_STICKER:
+            order.total_amount_cents = compute_total_cents(
+                material=order.material,
+                width_mm=order.width_mm,
+                height_mm=order.height_mm,
+                quantity=order.quantity,
+                with_relief=order.with_relief,
+                with_tinta_blanca=order.with_tinta_blanca,
+                with_barniz_brillo=order.with_barniz_brillo,
+                with_barniz_opaco=order.with_barniz_opaco,
+            )
+        else:
+            order.total_amount_cents = _compute_catalog_total_cents(order)
+
         order.status = "placed"
         order.placed_at = timezone.now()
         order.save(update_fields=["status", "placed_at", "total_amount_cents", "updated_at"])
@@ -216,34 +266,59 @@ def place_order(order: Order) -> Order:
 def transition_to_paid(order: Order, *, stripe_event: dict) -> Order:
     """placed → paid. System action (Stripe webhook); no actor.
 
-    Also generates the cut-path SVG so by the time the order hits
-    in_production the printer has both the artwork and the cutter file
-    waiting on it. Failure is logged but doesn't roll back the paid
-    transition — the SVG can be regenerated later from Django admin
-    via a management command.
+    Side effects branch by kind:
+      - sticker: generate the cut-path SVG so the printer has both the
+        artwork and the cutter file ready by the time the order moves to
+        in_production. Failure is logged but doesn't roll back the paid
+        transition — the SVG can be regenerated later via admin.
+      - catalog: lock the product row inside the transaction and
+        decrement stock_quantity by product_quantity. Race-safe via
+        select_for_update. If somehow under-stocked at this point (two
+        simultaneous payments), log a warning and allow the oversell —
+        the shop reconciles with whichever customer bought last.
     """
     with transaction.atomic():
         order = _lock(order)
         if order.status != "placed":
             raise InvalidTransition(f"Cannot mark paid from status {order.status!r}.")
+
+        if order.kind == KIND_CATALOG:
+            _decrement_product_stock(order)
+
         order.status = "paid"
         order.paid_at = timezone.now()
         order._history_user = None  # system action, no human actor
         order.save(update_fields=["status", "paid_at", "updated_at"])
 
-    # After the lock releases — file IO outside the row lock keeps the
-    # transaction window short. Failure here doesn't unwind the paid
-    # transition; the order is still paid, the cut SVG just needs a
-    # manual re-run.
-    try:
-        from .cut_path import generate_cut_path_file
-        generate_cut_path_file(order)
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).exception(
-            "Failed to generate cut_path for order %s: %s", order.uuid, exc,
-        )
+    # Sticker-only side effect, after the lock releases. File IO outside
+    # the row lock keeps the transaction window short. Failure here
+    # doesn't unwind the paid transition; the order is still paid, the
+    # cut SVG just needs a manual re-run.
+    if order.kind == KIND_STICKER:
+        try:
+            from .cut_path import generate_cut_path_file
+            generate_cut_path_file(order)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to generate cut_path for order %s: %s", order.uuid, exc,
+            )
     return order
+
+
+def _decrement_product_stock(order: Order) -> None:
+    """Catalog-side stock decrement. Must run inside an open transaction."""
+    from apps.products.models import Product
+
+    product = Product.objects.select_for_update().get(pk=order.product_id)
+    if product.stock_quantity < order.product_quantity:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Oversell allowed: product %s stock=%d, order qty=%d (order %s)",
+            product.pk, product.stock_quantity, order.product_quantity, order.uuid,
+        )
+    product.stock_quantity = max(0, product.stock_quantity - order.product_quantity)
+    product.save(update_fields=["stock_quantity", "updated_at"])
 
 
 def transition_to_in_production(order: Order, *, actor) -> Order:

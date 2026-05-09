@@ -15,15 +15,17 @@ class OrderFileInline(admin.TabularInline):
 class OrderAdmin(admin.ModelAdmin):
     list_display = (
         "short_pk",
+        "kind",
         "status",
-        "material",
+        "material_or_product",
         "size_display",
-        "quantity",
+        "quantity_display",
         "total_eur",
         "created_by",
         "created_at",
     )
     list_filter = (
+        "kind",
         "status",
         "material",
         "with_relief",
@@ -38,25 +40,31 @@ class OrderAdmin(admin.ModelAdmin):
         "postal_code",
         "stripe_payment_intent_id",
         "created_by__email",
+        "product__name",
     )
     ordering = ("-created_at",)
     date_hierarchy = "created_at"
 
-    fieldsets = (
+    _STICKER_FIELDSET = ("Sticker spec", {
+        "fields": (
+            "material",
+            ("width_mm", "height_mm"),
+            "quantity",
+            "with_relief",
+            "with_tinta_blanca",
+            ("with_barniz_brillo", "with_barniz_opaco"),
+            "relief_note",
+        ),
+    })
+    _CATALOG_FIELDSET = ("Catalog item", {
+        "fields": ("product", "product_quantity"),
+    })
+    _COMMON_FIELDSETS = (
         ("Order", {
-            "fields": ("uuid", "status", "created_by"),
+            "fields": ("uuid", "kind", "status", "created_by"),
         }),
-        ("Sticker spec", {
-            "fields": (
-                "material",
-                ("width_mm", "height_mm"),
-                "quantity",
-                "with_relief",
-                "with_tinta_blanca",
-                ("with_barniz_brillo", "with_barniz_opaco"),
-                "relief_note",
-            ),
-        }),
+    )
+    _TRAILING_FIELDSETS = (
         ("Shipping", {
             "fields": (
                 "recipient_name",
@@ -81,6 +89,26 @@ class OrderAdmin(admin.ModelAdmin):
             "fields": ("created_at", "updated_at"),
         }),
     )
+
+    def get_fieldsets(self, request, obj=None):
+        # Show the spec fieldset matching the order's kind. New orders
+        # (obj=None) default to sticker, matching the model default.
+        from .models import KIND_CATALOG
+        kind = getattr(obj, "kind", None) or "sticker"
+        spec_fieldset = (
+            self._CATALOG_FIELDSET if kind == KIND_CATALOG else self._STICKER_FIELDSET
+        )
+        return self._COMMON_FIELDSETS + (spec_fieldset,) + self._TRAILING_FIELDSETS
+
+    @admin.display(description="Item")
+    def material_or_product(self, obj):
+        if obj.kind == "catalog":
+            return obj.product.name if obj.product else "—"
+        return obj.material or "—"
+
+    @admin.display(description="Qty")
+    def quantity_display(self, obj):
+        return obj.product_quantity if obj.kind == "catalog" else obj.quantity
     readonly_fields = (
         "uuid",
         "created_at",
