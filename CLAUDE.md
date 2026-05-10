@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3a in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor, catalog products + Order.kind 2026-05-09, **AI background removal via rembg 2026-05-09 — feature complete + committed, polishing in flight (uncommitted, smart-cut margin behavior still buggy on complex artwork)**). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
+> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3a in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor, catalog products + Order.kind 2026-05-09, **AI background removal via rembg 2026-05-09 — repriced + perf-rewritten 2026-05-10 (~2.3s warm vs ~10-15s before, scipy dilation + 512px downsample + Gaussian smoothing + boot-time rembg warmup, plus PATCH response-shape bug fix)**). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -162,41 +162,22 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 
 ## 🚧 Status
 
-### Pick up here tomorrow (open thread from EOD 2026-05-09)
+### Pick up here tomorrow (open thread from EOD 2026-05-10)
 
-**Smart-cut margin slider still produces visual artifacts at large margins.**
-See the "Polishing work / Known issue carried into tomorrow" subsection
-under the smart-cut session log below for the diagnosis and three concrete
-hypotheses to try in order of cheapness.
+The smart-cut gorilla bug from 2026-05-09 is RESOLVED. Smart-cut now
+runs at ~2.3s warm (vs ~10-15s before) with proper bleed-margin
+dilation, Gaussian smoothing, and per-customer-pose RGB-preserving
+bleed ring.
 
-**Uncommitted work (both repos)** — the smart-cut polishing changes are
-saved but not committed because the gorilla repro still shows the bug.
-Don't squash these into a "feat" commit until the fix lands. Files
-modified locally:
+The next pickup item is **frontend-side, not backend**: the WebGL
+holographic FX layer overlays its iridescent rainbow over the bleed
+area's source-RGB pixels. Customer wants the holographic to TINT the
+existing background (e.g. teal stays teal but shimmers), not to
+replace it. Three fix candidates documented in
+`endosstudio_frontend/CLAUDE.md` "Pick up here tomorrow" section.
 
-Backend (working tree):
-- `apps/orders/services_smart_cut.py` (added morph-open + cleaned RGBA
-  data URL)
-- `apps/orders/cut_path.py` (extracted `_walk_alpha_contour`)
-- `apps/orders/views.py`, `apps/orders/tests/test_smart_cut.py` (new
-  smart-cut endpoint + 9 tests, all mocked)
-- `Dockerfile`, `requirements/base.txt` (rembg deps + model bake step)
-
-Frontend (working tree):
-- `src/views/EditorView.vue` (`onSmartCut` + cut-mode lock + margin re-
-  offset + base-image swap)
-- `src/components/editor/EditorToolbar.vue` (new ✨ button)
-- `src/components/editor/CanvasStage.vue` (forwards `setHolographicMaterial`,
-  `setSmoothingSlider`)
-- `src/composables/useCanvasEditor.ts` (uses `smoothPolygonPerimeter`
-  from utils now)
-- `src/services/orders.service.ts` + `src/types/order.ts` (`smartCut()` +
-  `SmartCutResponse`)
-- `src/utils/polygon.ts` (NEW — main-thread `offsetPolygonOutward` +
-  `smoothPolygonPerimeter` mirroring the worker copy)
-- `src/workers/autoCrop.worker.ts` (perimeter-flood for dark-on-dark
-  artwork interiors — committed earlier in the day, just listing here
-  in case I'm wrong about that)
+**No uncommitted backend work.** Everything from session 2026-05-10 is
+on `main` and pushed.
 
 ### Local dev caveat: rembg in the running container is ephemeral
 
@@ -502,6 +483,84 @@ Deferred to M3b:
   (sample the source image's edge bg color, render the chosen
   material's texture in the bleed at near-100% opacity tinted by
   that color — matches the printed-sticker look).
+
+### Done (Session 2026-05-10 — smart-cut perf rewrite + bugfix)
+
+#### A. Smart-cut margin handling moved to the backend
+
+The previous JS-side `offsetPolygonOutward` was mathematically wrong on
+non-convex polygons (per-vertex normal-bisector offset self-intersects
+on sharp concavities). Replaced with a backend dilation pipeline.
+
+`apps/orders/services_smart_cut.py` rewrite:
+- New `margin_mm` parameter (clamped to `MIN_MARGIN_MM=5`).
+- Replaced PIL `MaxFilter` with `scipy.ndimage.binary_dilation` —
+  same Minkowski-sum semantics, ~1000× faster on big kernels.
+- Mask processing (morph-open, dilate, contour walk) runs on a
+  downsampled 512-px-long-edge copy. Polygon coords scale back to
+  natural pixels before serializing. Final RGBA compose stays full-res.
+- Cleaned RGBA preserves ORIGINAL source RGB pixels in the bleed
+  ring, gated by the dilated alpha mask. Customer asked for
+  "background extending outward" feel — this delivers it.
+- Gaussian-smooth pass on both artwork and cut masks before the
+  contour walker, controlled by new `smoothness` param (1-10,
+  default 5). Fills narrow concavities a vinyl plotter can't follow.
+- Per-step timing logs left in service for regression detection.
+
+`apps/orders/views.py`:
+- Endpoint accepts `margin_mm` and `smoothness` (body or query
+  params), with 400 on non-int input.
+
+`apps/orders/apps.py` (NEW logic):
+- `OrdersConfig.ready()` warms the rembg ONNX session in a
+  background thread at Django boot, so the first customer no longer
+  eats the 25-40 s cold-start. Skipped under management commands so
+  `manage.py test` / `migrate` stay fast. Override via env var
+  `DJANGO_SKIP_REMBG_WARMUP=1`.
+
+Real timings on the gorilla (832×924 PNG, warm session):
+- Before: ~10-15s warm + 33s cold-start
+- After: **~2.3s warm**, ~3-5s on the second-warm-call after a
+  slider drag
+
+`apps/orders/tests/test_smart_cut.py`:
+- 11 tests passing (was 9). New: `test_cut_polygon_is_larger_than_artwork_polygon`
+  (regression for "no margin" bug); `test_margin_below_floor_is_clamped_to_5mm`.
+- Existing tests updated for the new contract — `points` (cut polygon
+  with bleed) is now strictly larger than `artwork_points` (tight
+  silhouette).
+
+#### B. PATCH response shape bug fix
+
+`OrderViewSet.partial_update` was returning `OrderUpdateSerializer.data`
+— write-only fields (material, shape, dimensions, shipping) without
+`uuid`, `status`, `total_amount_cents`, `files`, etc. The frontend
+stored that as `order.value` and subsequent reads of `order.value.uuid`
+got undefined → `POST /orders/undefined/...` → 404 → "Falló el
+recorte inteligente" toast.
+
+Fix: override `partial_update` to use the write serializer for input
+validation but return `OrderSerializer.data` for the response. Mirrors
+the same workaround `ProductViewSet` already uses (per CLAUDE.md
+"Backend response shape note").
+
+All 62 existing order tests still pass.
+
+#### C. Frontend companion changes (in `endosstudio_frontend`, not this repo)
+
+For context — the frontend session log is in
+`endosstudio_frontend/CLAUDE.md`, but the relevant backend-touching
+parts:
+- Smart-cut margin slider re-calls the backend debounced 600ms
+  (passing `margin_mm`).
+- Smoothness slider also re-calls the backend in smart-cut mode
+  (passing `smoothness`).
+- Per-call axios timeout bumped to 90s to absorb cold-starts.
+- New WebGL holographic FX layer (`useHolographicFX.ts`) — server
+  contract unchanged; this is purely frontend rendering.
+- AI macro reference textures (`docs/material-textures-prompts.md`,
+  `src/assets/textures/*_macro.png`) — server contract unchanged;
+  textures live entirely on the frontend bundle.
 
 ### Bootstrap deviations from the skill (still in force)
 - `django-allauth` pinned to **`>=65.0,<66.0`** (the modern `ACCOUNT_LOGIN_METHODS` / `ACCOUNT_SIGNUP_FIELDS` API only landed in 65.x).
