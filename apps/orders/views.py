@@ -257,10 +257,24 @@ class OrderViewSet(viewsets.ModelViewSet):
         (~2-4 s on CPU); see services_smart_cut.smart_cut_for_order. Allowed
         on any status — read-only, doesn't mutate the order. Ownership is
         enforced via `get_queryset` (customers see only their own orders).
+
+        Optional `margin_mm` (body or query param) controls the bleed margin
+        added around the detected silhouette. Defaults to 15 mm; floored at
+        the printable minimum (5 mm) inside the service.
         """
         order = self.get_object()
+        margin_raw = request.data.get("margin_mm") if request.data else None
+        if margin_raw is None:
+            margin_raw = request.query_params.get("margin_mm")
         try:
-            result = smart_cut_for_order(order)
+            margin_mm = int(margin_raw) if margin_raw is not None else 15
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "margin_mm must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = smart_cut_for_order(order, margin_mm=margin_mm)
         except NoOriginalFile:
             return Response(
                 {"detail": "No original file uploaded."},

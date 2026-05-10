@@ -80,22 +80,80 @@ class SmartCutServiceTests(BaseTestCase):
             "apps.orders.services_smart_cut.remove",
             return_value=_mock_rembg_white_square(),
         ):
-            result = smart_cut_for_order(order)
+            # Pass the printable-floor margin (5 mm) so the bleed dilation
+            # stays inside the 64×64 fixture. Default 15 mm would dilate
+            # the 48-px inset square past the image edge — `_walk_alpha`
+            # would then trace the clipped border instead of the silhouette.
+            result = smart_cut_for_order(order, margin_mm=5)
 
         self.assertEqual(result["kind"], "ok")
         self.assertGreaterEqual(len(result["points"]), 3)
+        self.assertGreaterEqual(len(result["artwork_points"]), 3)
         # Every point is image-space with integer coords.
         for pt in result["points"]:
             self.assertEqual(pt["kind"], "image")
             self.assertIsInstance(pt["x"], int)
             self.assertIsInstance(pt["y"], int)
-        # artwork_points mirrors points in this version.
-        self.assertEqual(result["artwork_points"], result["points"])
-        self.assertGreater(result["area_px"], 0)
+        # The cut polygon (`points`) is the artwork silhouette dilated by
+        # the bleed margin → strictly larger area than the tight artwork.
+        cut_area = result["area_px"]
+        self.assertGreater(cut_area, 0)
         # Cleaned RGBA inline as a data URL.
         self.assertTrue(
             result["cleaned_image_data_url"].startswith("data:image/png;base64,")
         )
+
+    def test_cut_polygon_is_larger_than_artwork_polygon(self):
+        """Bleed margin should produce a larger cut polygon than the
+        tight artwork silhouette. Regression for the original bug where
+        smart-cut returned the image fully cut without any margin."""
+        from apps.orders.services_smart_cut import _shoelace_area
+
+        _, customer = self.authenticate_as_customer()
+        order = _seed_order_with_original(self, customer)
+
+        with mock.patch(
+            "apps.orders.services_smart_cut.remove",
+            return_value=_mock_rembg_white_square(),
+        ):
+            result = smart_cut_for_order(order, margin_mm=5)
+
+        artwork_pts = [(p["x"], p["y"]) for p in result["artwork_points"]]
+        cut_pts = [(p["x"], p["y"]) for p in result["points"]]
+        artwork_area = _shoelace_area(artwork_pts)
+        cut_area = _shoelace_area(cut_pts)
+        self.assertGreater(
+            cut_area,
+            artwork_area,
+            "Bleed-dilated cut polygon must be strictly larger than the "
+            "tight artwork silhouette.",
+        )
+
+    def test_margin_below_floor_is_clamped_to_5mm(self):
+        """The view passes through whatever the customer sent; the service
+        floors it at MIN_MARGIN_MM. A 0 mm request must NOT produce a
+        zero-bleed polygon — the print shop minimum is 5 mm."""
+        from apps.orders.services_smart_cut import _shoelace_area
+
+        _, customer = self.authenticate_as_customer()
+        order = _seed_order_with_original(self, customer)
+
+        with mock.patch(
+            "apps.orders.services_smart_cut.remove",
+            return_value=_mock_rembg_white_square(),
+        ):
+            zero_result = smart_cut_for_order(order, margin_mm=0)
+            five_result = smart_cut_for_order(order, margin_mm=5)
+
+        zero_area = _shoelace_area(
+            [(p["x"], p["y"]) for p in zero_result["points"]]
+        )
+        five_area = _shoelace_area(
+            [(p["x"], p["y"]) for p in five_result["points"]]
+        )
+        # margin=0 must be clamped to 5; the resulting cut polygon must
+        # equal what we get when explicitly asking for 5.
+        self.assertEqual(zero_area, five_area)
 
     def test_no_original_file_raises_NoOriginalFile(self):
         _, customer = self.authenticate_as_customer()

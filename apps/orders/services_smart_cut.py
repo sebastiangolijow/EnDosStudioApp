@@ -11,26 +11,33 @@ Pipeline (sync, on the request thread; see CLAUDE.md "Smart cut (rembg)"):
   1. Open the order's `original` OrderFile with Pillow.
   2. rembg.remove(img, session=isnet-general-use) → foreground RGBA.
   3. Threshold the alpha channel at 128 to get a binary silhouette.
-  4. Walk the boundary with apps.orders.cut_path._walk_alpha_contour
-     (the same Moore tracer used by SVG cut-path generation).
-  5. Drop colinear runs (cheap O(n) post-pass — keeps ≥ 3 pts).
-  6. Return JSON-serializable dict matching the frontend's expected
-     polygon shape (image-natural-pixel coordinates, no bleed offset —
-     the frontend handles bleed margin via its existing slider).
+  4. Morphological opening (MinFilter then MaxFilter, kernel 13) to drop
+     thin appendages (single-pixel bridges between the main silhouette
+     and decorative bits) that would otherwise become curving outward
+     "tendrils" once we dilate.
+  5. Bleed-margin dilation: MaxFilter with a kernel sized from the caller-
+     supplied `margin_mm` and the image's px-per-mm. Produces a clean
+     simple-polygon expansion at any margin (something normal-bisector
+     offset on the frontend cannot do for non-convex shapes).
+  6. Walk the boundary with apps.orders.cut_path._walk_alpha_contour.
+  7. Drop colinear runs (cheap O(n) post-pass — keeps ≥ 3 pts).
+  8. Return JSON dict + a base64 PNG `cleaned_image_data_url` whose
+     bleed ring carries the ORIGINAL RGB pixels (so the customer sees
+     the artwork's surrounding color extending outward, not transparent
+     truncation).
 
-Why no bleed offset on the backend: the frontend already owns
-`offsetPolygonOutward` in src/workers/autoCrop.worker.ts plus the
-`marginMm` slider + `pxPerMm` derivation logic. Replicating that
-server-side would split the source of truth across two languages. The
-smart-cut polygon is symmetric to the worker's `artworkPoints` (tight
-artwork silhouette, no margin); customers who want margin re-run the
-classical Auto cut with the slider.
+Why backend dilation (and not frontend `offsetPolygonOutward`): the JS
+normal-bisector offset is mathematically incorrect for non-convex
+polygons — sharp concavities self-intersect, producing visible polygon
+fragmentation at large margins. PIL's MaxFilter implements proper
+Minkowski-sum dilation on the binary mask, which always yields a simple
+polygon. The frontend keeps its slider; the slider just re-calls this
+endpoint with the new `margin_mm`.
 
 Deferred to M3b:
-  - Caching by file-bytes hash (5x speedup on customer re-clicks).
+  - Caching by (file-bytes hash, margin_mm) (5x speedup on slider
+    scrubbing back and forth).
   - Multi-piece detection (today we keep the largest contour only).
-  - Backend bleed-margin offset (mirror offsetPolygonOutward in Python
-    so smart cut + slider play together natively).
 """
 from __future__ import annotations
 
@@ -148,17 +155,79 @@ def _shoelace_area(points: list[tuple[int, int]]) -> float:
 # === Public API ===
 
 
-def smart_cut_for_order(order: Order) -> dict:
+# Print-shop minimum bleed margin (millimeters). Below this, die-cutting
+# tolerance alone consumes the margin and the customer's design gets
+# clipped at the edge. The view clamps `margin_mm` to this floor.
+MIN_MARGIN_MM = 5
+
+# Kernel ceiling for the bleed dilation. PIL's MaxFilter scales O(kernel)
+# per pixel; on a 2048×2048 image a kernel of 200 is already ~1 s. Above
+# this we fall back to multiple passes with a smaller kernel — same
+# Minkowski result, bounded per-pass cost.
+_MAX_KERNEL = 99
+
+
+def _odd(n: int) -> int:
+    """PIL's MinFilter/MaxFilter take ODD kernel sizes only."""
+    n = max(1, int(n))
+    return n if n % 2 == 1 else n + 1
+
+
+def _dilate_alpha(mask: Image.Image, total_px: int) -> Image.Image:
+    """Apply MaxFilter dilation by `total_px` total pixels.
+
+    Single-pass when total_px ≤ _MAX_KERNEL. For larger margins, repeat
+    smaller-kernel passes — multi-pass dilation with kernel k1 then k2
+    is equivalent to a single-pass (k1+k2-1) dilation, but each pass
+    stays under the per-pixel cost ceiling. Always uses ODD kernels.
+    """
+    if total_px <= 0:
+        return mask
+    out = mask
+    remaining = total_px
+    # Each pass advances the boundary by (kernel - 1) // 2 pixels, so a
+    # pass with kernel k extends the silhouette by (k - 1) // 2.
+    while remaining > 0:
+        k = _odd(min(remaining * 2 + 1, _MAX_KERNEL))
+        out = out.filter(ImageFilter.MaxFilter(k))
+        remaining -= (k - 1) // 2
+    return out
+
+
+def _px_per_mm_for_image(order: Order, image_width_px: int) -> float:
+    """Convert millimeters → image-natural pixels.
+
+    Mirrors the frontend's `pxPerMm` computation in EditorView.vue. When
+    the customer has already chosen `width_mm` on /order-config, we know
+    the print scale exactly; otherwise we assume the long edge prints at
+    100 mm (typical sticker size). The frontend uses the same fallback,
+    so the bleed margin painted on the canvas matches the dilation here.
+    """
+    DEFAULT_LONG_EDGE_MM = 100.0
+    if order.width_mm and order.width_mm > 0:
+        return image_width_px / float(order.width_mm)
+    return image_width_px / DEFAULT_LONG_EDGE_MM
+
+
+def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
     """Run AI background removal on the order's original image.
+
+    Args:
+        order: the Order (must have an `original` OrderFile).
+        margin_mm: bleed margin to add around the detected silhouette.
+            Clamped to MIN_MARGIN_MM = 5 (printable minimum). Default 15
+            matches the frontend's slider default.
 
     Returns a JSON-serializable dict matching the frontend's
     SmartCutResponse type:
 
-        {"kind": "ok", "points": [{"kind": "image", "x": ..., "y": ...}, ...],
-         "artwork_points": [...same array...], "area_px": float}
+        {"kind": "ok",
+         "points":          [...inflated cut polygon...],     # bleed-out
+         "artwork_points":  [...tight artwork silhouette...], # no bleed
+         "area_px": float,
+         "cleaned_image_data_url": "data:image/png;base64,..."}
 
-    or {"kind": "no-contour-found", "points": [], "artwork_points": [],
-       "area_px": 0} if rembg returned a fully transparent / empty mask.
+    or {"kind": "no-contour-found", ...} if rembg returned an empty mask.
 
     Raises NoOriginalFile or SmartCutModelUnavailable on the documented
     error paths; the view layer translates those to 400 / 503.
@@ -166,6 +235,10 @@ def smart_cut_for_order(order: Order) -> dict:
     file_obj = order.files.filter(kind="original").first()
     if file_obj is None:
         raise NoOriginalFile(f"Order {order.uuid} has no 'original' file.")
+
+    # Floor the margin at the printable minimum. Above this, no cap —
+    # the slider's max is enforced on the frontend.
+    margin_mm = max(MIN_MARGIN_MM, int(margin_mm))
 
     # rembg expects a PIL Image (or bytes). RGB strip avoids edge cases
     # where the source already has an alpha channel — we want the model
@@ -192,23 +265,20 @@ def smart_cut_for_order(order: Order) -> dict:
     # Threshold alpha → binary mask.
     alpha = rgba.split()[3].point(lambda v: 255 if v > 128 else 0)
 
-    # Morphological opening: erode then dilate. Drops thin appendages
-    # (single-pixel-wide bridges between the main silhouette and
-    # decorative bits like leaves/sparkles/feathers in the source art),
-    # collapses tiny disconnected islands, and smooths jagged single-
-    # pixel boundary noise. Without this, those thin bridges become
-    # huge curving "tendrils" when the frontend offsets the polygon
-    # outward by the bleed margin.
-    #
-    # Kernel size = 13 px on a typical 1024-px mask gets the leaves out
-    # but keeps fur tufts (which are wider than 13 px). PIL's MinFilter
-    # / MaxFilter take ODD kernel sizes only.
-    kernel = 13
-    eroded = alpha.filter(ImageFilter.MinFilter(kernel))
-    cleaned = eroded.filter(ImageFilter.MaxFilter(kernel))
+    # === Step A: morphological opening — kill thin appendages ===
+    # Without this, single-pixel-wide bridges between the silhouette and
+    # decorative bits (leaves/sparkles/feathers) become huge curving
+    # tendrils once we dilate. Kernel 13 on a typical 1024-px mask drops
+    # the leaves but keeps fur tufts. (Tested on the gorilla repro.)
+    OPEN_KERNEL = 13
+    eroded = alpha.filter(ImageFilter.MinFilter(OPEN_KERNEL))
+    artwork_mask = eroded.filter(ImageFilter.MaxFilter(OPEN_KERNEL))
 
-    boundary = _walk_alpha_contour(cleaned)
-    if boundary is None or len(boundary) < 3:
+    # Walk the TIGHT artwork silhouette first — this is the polygon the
+    # customer sees as the "no-bleed" inner boundary, and what the canvas
+    # uses to clip the base image when removeBackground is on.
+    artwork_boundary = _walk_alpha_contour(artwork_mask)
+    if artwork_boundary is None or len(artwork_boundary) < 3:
         return {
             "kind": "no-contour-found",
             "points": [],
@@ -217,40 +287,59 @@ def smart_cut_for_order(order: Order) -> dict:
             "cleaned_image_data_url": None,
         }
 
-    simplified = _drop_colinear(boundary)
-    area_px = _shoelace_area(simplified)
-    points_payload = [
-        {"kind": "image", "x": int(x), "y": int(y)} for x, y in simplified
+    artwork_simplified = _drop_colinear(artwork_boundary)
+    artwork_payload = [
+        {"kind": "image", "x": int(x), "y": int(y)} for x, y in artwork_simplified
     ]
 
-    # Build the visible image: rembg's RGB + the OPENED alpha mask.
-    # Critical: the alpha channel here must match the polygon contour
-    # we just traced. If we used the raw rembg alpha, decorative bits
-    # the morphological opening dropped (leaves, sparkles) would still
-    # be visible to the customer — but outside the cut polygon, so
-    # they'd be visually clipped off. Better to drop them at both
-    # layers consistently.
-    rgb_only = rgba.convert("RGB")
-    visible = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    visible.paste(rgb_only, mask=cleaned)
+    # === Step B: dilate by the bleed margin → cut mask ===
+    # MaxFilter performs Minkowski-sum-with-disk on the binary mask. For
+    # non-convex polygons this produces a clean simple-polygon expansion
+    # — exactly what the frontend's normal-bisector offset cannot do.
+    px_per_mm = _px_per_mm_for_image(order, rgba.size[0])
+    margin_px = int(round(margin_mm * px_per_mm))
+    cut_mask = _dilate_alpha(artwork_mask, margin_px)
 
-    # Encode as a base64 PNG data URL so the frontend can swap it in as
-    # the canvas's base layer. PNG compresses alpha-zeroed pixels to
-    # almost nothing — for a typical 1024x1024 sticker the data URL is
-    # 50-200 KB. Inline transmission is fine; no point setting up a
-    # separate file endpoint just for this.
+    cut_boundary = _walk_alpha_contour(cut_mask)
+    if cut_boundary is None or len(cut_boundary) < 3:
+        # Should not happen — dilation only grows the mask. If it does,
+        # fall back to the tight artwork polygon so we don't break the
+        # editor.
+        cut_simplified = artwork_simplified
+    else:
+        cut_simplified = _drop_colinear(cut_boundary)
+
+    cut_payload = [
+        {"kind": "image", "x": int(x), "y": int(y)} for x, y in cut_simplified
+    ]
+    area_px = _shoelace_area(cut_simplified)
+
+    # === Step C: build the visible image — RGB through the CUT mask ===
+    # Pixels outside the artwork silhouette but inside the bleed ring
+    # carry the ORIGINAL source RGB (whatever color was around the
+    # subject in the customer's photo). That's the "background extends
+    # outward" feel the customer wanted: a teal vinyl bleed for a
+    # gorilla on teal, not a transparent ring of nothing.
+    #
+    # The rembg-cleaned RGB is what we paint with — pixels rembg
+    # decided are background already have rgba alpha=0, but we use the
+    # original `pil_in` so we get whatever was actually there. The cut
+    # mask gates which pixels are visible.
+    visible = Image.new("RGBA", pil_in.size, (0, 0, 0, 0))
+    visible.paste(pil_in, mask=cut_mask)
+
+    # Encode as a base64 PNG data URL. PNG compresses the alpha-zeroed
+    # outside-the-mask area heavily; typical 1024x1024 sticker fits in
+    # 50-200 KB inline.
     png_buf = io.BytesIO()
     visible.save(png_buf, format="PNG", optimize=True)
     cleaned_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
     cleaned_data_url = f"data:image/png;base64,{cleaned_b64}"
 
-    # `artwork_points` is identical to `points` in this version (no
-    # backend bleed offset). Keeping the field present means M3b can
-    # introduce real backend offset without a wire-format change.
     return {
         "kind": "ok",
-        "points": points_payload,
-        "artwork_points": points_payload,
+        "points": cut_payload,
+        "artwork_points": artwork_payload,
         "area_px": area_px,
         "cleaned_image_data_url": cleaned_data_url,
     }
@@ -260,4 +349,5 @@ __all__ = (
     "smart_cut_for_order",
     "NoOriginalFile",
     "SmartCutModelUnavailable",
+    "MIN_MARGIN_MM",
 )
