@@ -44,9 +44,12 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import time
 from typing import Optional
 
-from PIL import Image, ImageFilter
+import numpy as np
+from PIL import Image
+from scipy import ndimage
 
 from .cut_path import _walk_alpha_contour
 from .models import Order
@@ -160,38 +163,46 @@ def _shoelace_area(points: list[tuple[int, int]]) -> float:
 # clipped at the edge. The view clamps `margin_mm` to this floor.
 MIN_MARGIN_MM = 5
 
-# Kernel ceiling for the bleed dilation. PIL's MaxFilter scales O(kernel)
-# per pixel; on a 2048×2048 image a kernel of 200 is already ~1 s. Above
-# this we fall back to multiple passes with a smaller kernel — same
-# Minkowski result, bounded per-pass cost.
-_MAX_KERNEL = 99
+# Long-edge target for the mask-processing pipeline. rembg runs at full
+# resolution (model-determined), but morph-opening, bleed dilation, and
+# contour walking all run on a downsampled binary mask — a silhouette
+# at 512 px is visually indistinguishable from one at 1024 px once the
+# polygon is rendered, and the downstream ops are 4-16× faster.
+_MASK_PROCESSING_LONG_EDGE = 512
+
+# Pixel kernel for the morph-opening pass that drops thin bridges from
+# rembg output. Sized at the DOWNSAMPLED resolution — at 512 px long
+# edge, kernel 7 px ≈ kernel 13-14 on the original. (Tested on the
+# gorilla repro: drops the leaves, keeps fur tufts.)
+_OPEN_KERNEL_DOWNSAMPLED = 7
 
 
-def _odd(n: int) -> int:
-    """PIL's MinFilter/MaxFilter take ODD kernel sizes only."""
-    n = max(1, int(n))
-    return n if n % 2 == 1 else n + 1
+def _binary_dilate(mask_array: np.ndarray, radius_px: int) -> np.ndarray:
+    """Dilate a binary 2-D bool/uint8 array by `radius_px` pixels.
 
+    scipy's `binary_dilation` is C-implemented and orders of magnitude
+    faster than PIL's MaxFilter on big kernels. With `iterations=N`
+    using the default 3×3 cross structuring element, every pass extends
+    the silhouette by 1 px, so we set iterations directly to the radius.
 
-def _dilate_alpha(mask: Image.Image, total_px: int) -> Image.Image:
-    """Apply MaxFilter dilation by `total_px` total pixels.
-
-    Single-pass when total_px ≤ _MAX_KERNEL. For larger margins, repeat
-    smaller-kernel passes — multi-pass dilation with kernel k1 then k2
-    is equivalent to a single-pass (k1+k2-1) dilation, but each pass
-    stays under the per-pixel cost ceiling. Always uses ODD kernels.
+    Returns a bool array same shape as input.
     """
-    if total_px <= 0:
-        return mask
-    out = mask
-    remaining = total_px
-    # Each pass advances the boundary by (kernel - 1) // 2 pixels, so a
-    # pass with kernel k extends the silhouette by (k - 1) // 2.
-    while remaining > 0:
-        k = _odd(min(remaining * 2 + 1, _MAX_KERNEL))
-        out = out.filter(ImageFilter.MaxFilter(k))
-        remaining -= (k - 1) // 2
-    return out
+    if radius_px <= 0:
+        return mask_array.astype(bool, copy=True)
+    return ndimage.binary_dilation(mask_array, iterations=int(radius_px))
+
+
+def _binary_open(mask_array: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Morphological opening (erode then dilate) by `kernel_size` pixels.
+
+    Drops thin appendages narrower than `kernel_size`. Same scipy path,
+    same speed advantage. Translates `kernel_size` (odd, like a filter
+    window) to iterations = kernel_size // 2 for the cross structuring
+    element.
+    """
+    iters = max(1, kernel_size // 2)
+    eroded = ndimage.binary_erosion(mask_array, iterations=iters)
+    return ndimage.binary_dilation(eroded, iterations=iters)
 
 
 def _px_per_mm_for_image(order: Order, image_width_px: int) -> float:
@@ -240,19 +251,28 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
     # the slider's max is enforced on the frontend.
     margin_mm = max(MIN_MARGIN_MM, int(margin_mm))
 
+    # Per-step timing for performance debugging. Logged at INFO so a
+    # single grep in docker logs reveals the breakdown. The numbers
+    # informed the downsampling + scipy switch — keep them around so we
+    # catch regressions if a future change makes a step slow again.
+    timings: dict[str, float] = {}
+    t0 = time.perf_counter()
+
     # rembg expects a PIL Image (or bytes). RGB strip avoids edge cases
     # where the source already has an alpha channel — we want the model
     # to redo the foreground decision from RGB alone.
     with file_obj.file.open("rb") as f:
         raw_bytes = f.read()
     pil_in = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    timings["read_decode"] = time.perf_counter() - t0
 
-    # Run inference. Module-cached session.
+    # Run inference. Module-cached session (warmed at boot — see apps.py).
     if remove is None:
         raise SmartCutModelUnavailable(
             f"rembg not installed: {_rembg_import_error}",
         )
     session = _get_session()
+    t1 = time.perf_counter()
     try:
         rgba = remove(pil_in, session=session)
     except Exception as exc:
@@ -261,23 +281,73 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
         ) from exc
     if rgba.mode != "RGBA":
         rgba = rgba.convert("RGBA")
+    timings["rembg"] = time.perf_counter() - t1
 
-    # Threshold alpha → binary mask.
-    alpha = rgba.split()[3].point(lambda v: 255 if v > 128 else 0)
+    # === Downsample for mask processing ===
+    # Walking a 1024×1024 contour in pure Python is slow (~0.5-1 s per
+    # walk, and we do it twice). Scipy's morph ops are fast but still
+    # cheaper at 512² than 1024². The polygon visible to the customer
+    # at canvas-render scale doesn't need the extra precision — the
+    # cut mask uploaded to the printer is regenerated from the polygon
+    # at print resolution server-side anyway.
+    natural_w, natural_h = rgba.size
+    long_edge = max(natural_w, natural_h)
+    if long_edge > _MASK_PROCESSING_LONG_EDGE:
+        scale = _MASK_PROCESSING_LONG_EDGE / long_edge
+        proc_w = int(round(natural_w * scale))
+        proc_h = int(round(natural_h * scale))
+    else:
+        scale = 1.0
+        proc_w, proc_h = natural_w, natural_h
 
-    # === Step A: morphological opening — kill thin appendages ===
-    # Without this, single-pixel-wide bridges between the silhouette and
-    # decorative bits (leaves/sparkles/feathers) become huge curving
-    # tendrils once we dilate. Kernel 13 on a typical 1024-px mask drops
-    # the leaves but keeps fur tufts. (Tested on the gorilla repro.)
-    OPEN_KERNEL = 13
-    eroded = alpha.filter(ImageFilter.MinFilter(OPEN_KERNEL))
-    artwork_mask = eroded.filter(ImageFilter.MaxFilter(OPEN_KERNEL))
+    t2 = time.perf_counter()
+    # Downsample alpha → binary numpy array. NEAREST keeps the binary
+    # threshold crisp; bilinear would muddy the edge.
+    alpha_full = rgba.split()[3]
+    if scale < 1.0:
+        alpha_small = alpha_full.resize((proc_w, proc_h), Image.NEAREST)
+    else:
+        alpha_small = alpha_full
+    mask_arr = np.asarray(alpha_small, dtype=np.uint8) > 128
+    timings["downsample"] = time.perf_counter() - t2
 
-    # Walk the TIGHT artwork silhouette first — this is the polygon the
-    # customer sees as the "no-bleed" inner boundary, and what the canvas
-    # uses to clip the base image when removeBackground is on.
-    artwork_boundary = _walk_alpha_contour(artwork_mask)
+    # === Step A: morphological opening (scipy, downsampled) ===
+    t3 = time.perf_counter()
+    artwork_arr = _binary_open(mask_arr, _OPEN_KERNEL_DOWNSAMPLED)
+    timings["morph_open"] = time.perf_counter() - t3
+
+    if not artwork_arr.any():
+        return {
+            "kind": "no-contour-found",
+            "points": [],
+            "artwork_points": [],
+            "area_px": 0,
+            "cleaned_image_data_url": None,
+        }
+
+    # === Step B: bleed-margin dilation (scipy) ===
+    # margin_mm → natural-resolution px → downsampled px so the dilation
+    # iterations match the customer's intent in physical millimeters.
+    px_per_mm_natural = _px_per_mm_for_image(order, natural_w)
+    margin_px_natural = int(round(margin_mm * px_per_mm_natural))
+    margin_px_proc = max(1, int(round(margin_px_natural * scale)))
+
+    t4 = time.perf_counter()
+    cut_arr = _binary_dilate(artwork_arr, margin_px_proc)
+    timings["dilate"] = time.perf_counter() - t4
+
+    # === Step C: walk both contours (downsampled, then scale up) ===
+    t5 = time.perf_counter()
+    artwork_pil_small = Image.fromarray(
+        (artwork_arr.astype(np.uint8)) * 255, mode="L"
+    )
+    cut_pil_small = Image.fromarray(
+        (cut_arr.astype(np.uint8)) * 255, mode="L"
+    )
+    artwork_boundary = _walk_alpha_contour(artwork_pil_small)
+    cut_boundary = _walk_alpha_contour(cut_pil_small)
+    timings["contour_walk"] = time.perf_counter() - t5
+
     if artwork_boundary is None or len(artwork_boundary) < 3:
         return {
             "kind": "no-contour-found",
@@ -288,53 +358,57 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
         }
 
     artwork_simplified = _drop_colinear(artwork_boundary)
+    cut_simplified = (
+        _drop_colinear(cut_boundary)
+        if cut_boundary and len(cut_boundary) >= 3
+        else artwork_simplified  # dilation can only grow → very rare
+    )
+
+    # Scale polygon coords back to natural-resolution pixels.
+    inv_scale = 1.0 / scale if scale > 0 else 1.0
     artwork_payload = [
-        {"kind": "image", "x": int(x), "y": int(y)} for x, y in artwork_simplified
+        {"kind": "image", "x": int(round(x * inv_scale)), "y": int(round(y * inv_scale))}
+        for x, y in artwork_simplified
     ]
-
-    # === Step B: dilate by the bleed margin → cut mask ===
-    # MaxFilter performs Minkowski-sum-with-disk on the binary mask. For
-    # non-convex polygons this produces a clean simple-polygon expansion
-    # — exactly what the frontend's normal-bisector offset cannot do.
-    px_per_mm = _px_per_mm_for_image(order, rgba.size[0])
-    margin_px = int(round(margin_mm * px_per_mm))
-    cut_mask = _dilate_alpha(artwork_mask, margin_px)
-
-    cut_boundary = _walk_alpha_contour(cut_mask)
-    if cut_boundary is None or len(cut_boundary) < 3:
-        # Should not happen — dilation only grows the mask. If it does,
-        # fall back to the tight artwork polygon so we don't break the
-        # editor.
-        cut_simplified = artwork_simplified
-    else:
-        cut_simplified = _drop_colinear(cut_boundary)
-
     cut_payload = [
-        {"kind": "image", "x": int(x), "y": int(y)} for x, y in cut_simplified
+        {"kind": "image", "x": int(round(x * inv_scale)), "y": int(round(y * inv_scale))}
+        for x, y in cut_simplified
     ]
-    area_px = _shoelace_area(cut_simplified)
+    area_px = _shoelace_area(cut_simplified) * (inv_scale * inv_scale)
 
-    # === Step C: build the visible image — RGB through the CUT mask ===
-    # Pixels outside the artwork silhouette but inside the bleed ring
-    # carry the ORIGINAL source RGB (whatever color was around the
-    # subject in the customer's photo). That's the "background extends
-    # outward" feel the customer wanted: a teal vinyl bleed for a
-    # gorilla on teal, not a transparent ring of nothing.
-    #
-    # The rembg-cleaned RGB is what we paint with — pixels rembg
-    # decided are background already have rgba alpha=0, but we use the
-    # original `pil_in` so we get whatever was actually there. The cut
-    # mask gates which pixels are visible.
+    # === Step D: build the visible image — RGB through the CUT mask ===
+    # Upsample the cut mask back to natural resolution so the paste
+    # gates the original full-res RGB pixels (no quality loss in the
+    # cleaned PNG the customer sees).
+    t6 = time.perf_counter()
+    if scale < 1.0:
+        cut_mask_full = Image.fromarray(
+            (cut_arr.astype(np.uint8)) * 255, mode="L"
+        ).resize((natural_w, natural_h), Image.NEAREST)
+    else:
+        cut_mask_full = cut_pil_small
     visible = Image.new("RGBA", pil_in.size, (0, 0, 0, 0))
-    visible.paste(pil_in, mask=cut_mask)
+    visible.paste(pil_in, mask=cut_mask_full)
+    timings["compose_visible"] = time.perf_counter() - t6
 
-    # Encode as a base64 PNG data URL. PNG compresses the alpha-zeroed
-    # outside-the-mask area heavily; typical 1024x1024 sticker fits in
-    # 50-200 KB inline.
+    t7 = time.perf_counter()
     png_buf = io.BytesIO()
     visible.save(png_buf, format="PNG", optimize=True)
     cleaned_b64 = base64.b64encode(png_buf.getvalue()).decode("ascii")
     cleaned_data_url = f"data:image/png;base64,{cleaned_b64}"
+    timings["png_encode"] = time.perf_counter() - t7
+
+    timings["total"] = time.perf_counter() - t0
+    logger.info(
+        "smart_cut order=%s margin_mm=%s natural=%sx%s proc=%sx%s timings=%s",
+        order.uuid,
+        margin_mm,
+        natural_w,
+        natural_h,
+        proc_w,
+        proc_h,
+        {k: round(v, 3) for k, v in timings.items()},
+    )
 
     return {
         "kind": "ok",
