@@ -176,6 +176,27 @@ _MASK_PROCESSING_LONG_EDGE = 512
 # gorilla repro: drops the leaves, keeps fur tufts.)
 _OPEN_KERNEL_DOWNSAMPLED = 7
 
+# Smoothness slider: maps the customer-facing 1-10 value to a Gaussian
+# sigma (in DOWNSAMPLED pixels) applied to the binary mask before the
+# contour walker traces it. Higher sigma = rounder cuts. The defaults
+# below were tuned against the gorilla illustration so default smoothness
+# (5) produces a cut line a vinyl plotter can physically follow without
+# stalling on every fur-tuft notch.
+#
+# Why smooth the mask, not the polygon: blurring a binary mask is a true
+# 2-D morphological smoothing — narrow concavities get filled, wide ones
+# survive. Smoothing the polygon (perimeter-Gaussian on vertices) cannot
+# do that — it just averages adjacent points and a deep narrow notch
+# survives as a pinched feature.
+_SMOOTH_SIGMA_MIN = 1.0
+_SMOOTH_SIGMA_MAX = 8.0
+_SMOOTH_DEFAULT = 5  # 1-10 scale; 5 ≈ sigma 4 px
+
+# Threshold applied to the blurred float mask to rebinarize. 0.5 keeps
+# the cut polygon's signed-distance to the original silhouette near
+# zero; lower values would expand the polygon, higher would shrink.
+_SMOOTH_THRESHOLD = 0.5
+
 
 def _binary_dilate(mask_array: np.ndarray, radius_px: int) -> np.ndarray:
     """Dilate a binary 2-D bool/uint8 array by `radius_px` pixels.
@@ -205,6 +226,39 @@ def _binary_open(mask_array: np.ndarray, kernel_size: int) -> np.ndarray:
     return ndimage.binary_dilation(eroded, iterations=iters)
 
 
+def _smooth_mask(mask_array: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Gaussian-smooth a binary mask, then re-threshold.
+
+    The math: convert to float, run scipy.ndimage.gaussian_filter, threshold
+    at 0.5. A pixel survives the threshold if more than half of the
+    Gaussian-weighted neighborhood was foreground — equivalent to rounding
+    the boundary at radius ≈ sigma_px.
+
+    Critical for cuttability: the rembg silhouette of an illustration with
+    fur / hair / fine details has many concavities narrower than any
+    physical cutter blade can navigate. Blurring the mask fills those
+    notches at the source, producing a polygon a vinyl plotter can actually
+    follow without stalling.
+
+    sigma_px=0 short-circuits to a copy (no work). All ops at downsampled
+    resolution, so sigma values are tiny — 8 px on a 512-px-edge mask is
+    ~16 px on the original, plenty of rounding without losing the overall
+    silhouette shape.
+    """
+    if sigma_px <= 0:
+        return mask_array.astype(bool, copy=True)
+    float_mask = mask_array.astype(np.float32)
+    blurred = ndimage.gaussian_filter(float_mask, sigma=sigma_px)
+    return blurred > _SMOOTH_THRESHOLD
+
+
+def _sigma_for_smoothness(smoothness_1_to_10: int) -> float:
+    """Map the customer's 1-10 smoothness slider to a Gaussian sigma in
+    downsampled pixels. Linear interpolation between MIN and MAX."""
+    s = max(1, min(10, int(smoothness_1_to_10)))
+    return _SMOOTH_SIGMA_MIN + (s - 1) * (_SMOOTH_SIGMA_MAX - _SMOOTH_SIGMA_MIN) / 9.0
+
+
 def _px_per_mm_for_image(order: Order, image_width_px: int) -> float:
     """Convert millimeters → image-natural pixels.
 
@@ -220,7 +274,9 @@ def _px_per_mm_for_image(order: Order, image_width_px: int) -> float:
     return image_width_px / DEFAULT_LONG_EDGE_MM
 
 
-def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
+def smart_cut_for_order(
+    order: Order, margin_mm: int = 15, smoothness: int = _SMOOTH_DEFAULT
+) -> dict:
     """Run AI background removal on the order's original image.
 
     Args:
@@ -228,6 +284,11 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
         margin_mm: bleed margin to add around the detected silhouette.
             Clamped to MIN_MARGIN_MM = 5 (printable minimum). Default 15
             matches the frontend's slider default.
+        smoothness: 1-10 slider value controlling how aggressively the
+            cut line rounds sharp concavities (fur, hair, decoration
+            spikes). Default 5 produces a cut line a typical vinyl
+            plotter can physically follow. 1 = follow silhouette tightly
+            (may be uncuttable on detailed art); 10 = very rounded.
 
     Returns a JSON-serializable dict matching the frontend's
     SmartCutResponse type:
@@ -336,6 +397,31 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
     cut_arr = _binary_dilate(artwork_arr, margin_px_proc)
     timings["dilate"] = time.perf_counter() - t4
 
+    # === Step B': Gaussian-smooth both masks for cuttable boundaries ===
+    # The contour walker emits one vertex per boundary pixel — on a
+    # detailed silhouette (fur, hair, decoration) that's hundreds of
+    # near-zero-radius concavities a vinyl plotter physically can't
+    # follow. Blurring the binary mask before the walk rounds those
+    # notches at the source. Apply to BOTH masks with the same sigma
+    # so the artwork-clip and cut-line stay parallel curves and the
+    # bleed ring keeps a uniform width.
+    sigma_px = _sigma_for_smoothness(smoothness)
+    t_smooth = time.perf_counter()
+    artwork_arr = _smooth_mask(artwork_arr, sigma_px)
+    cut_arr = _smooth_mask(cut_arr, sigma_px)
+    timings["smooth"] = time.perf_counter() - t_smooth
+
+    if not artwork_arr.any():
+        # Smoothing erased the silhouette (would only happen if the
+        # silhouette was a thin line and sigma was huge). Bail.
+        return {
+            "kind": "no-contour-found",
+            "points": [],
+            "artwork_points": [],
+            "area_px": 0,
+            "cleaned_image_data_url": None,
+        }
+
     # === Step C: walk both contours (downsampled, then scale up) ===
     t5 = time.perf_counter()
     artwork_pil_small = Image.fromarray(
@@ -400,9 +486,10 @@ def smart_cut_for_order(order: Order, margin_mm: int = 15) -> dict:
 
     timings["total"] = time.perf_counter() - t0
     logger.info(
-        "smart_cut order=%s margin_mm=%s natural=%sx%s proc=%sx%s timings=%s",
+        "smart_cut order=%s margin_mm=%s smoothness=%s natural=%sx%s proc=%sx%s timings=%s",
         order.uuid,
         margin_mm,
+        smoothness,
         natural_w,
         natural_h,
         proc_w,

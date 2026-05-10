@@ -261,6 +261,9 @@ class OrderViewSet(viewsets.ModelViewSet):
         Optional `margin_mm` (body or query param) controls the bleed margin
         added around the detected silhouette. Defaults to 15 mm; floored at
         the printable minimum (5 mm) inside the service.
+
+        Optional `smoothness` (1-10) controls how aggressively the cut line
+        rounds sharp concavities. Defaults to 5 (cuttable on most plotters).
         """
         order = self.get_object()
         margin_raw = request.data.get("margin_mm") if request.data else None
@@ -273,8 +276,20 @@ class OrderViewSet(viewsets.ModelViewSet):
                 {"detail": "margin_mm must be an integer."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        smooth_raw = request.data.get("smoothness") if request.data else None
+        if smooth_raw is None:
+            smooth_raw = request.query_params.get("smoothness")
         try:
-            result = smart_cut_for_order(order, margin_mm=margin_mm)
+            smoothness = int(smooth_raw) if smooth_raw is not None else 5
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "smoothness must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = smart_cut_for_order(
+                order, margin_mm=margin_mm, smoothness=smoothness
+            )
         except NoOriginalFile:
             return Response(
                 {"detail": "No original file uploaded."},
