@@ -132,7 +132,20 @@ class OrderViewSet(viewsets.ModelViewSet):
                 {"detail": f"Cannot edit order in status {order.status!r}; only drafts are editable."},
                 status=status.HTTP_409_CONFLICT,
             )
-        return super().partial_update(request, *args, **kwargs)
+        # Use OrderUpdateSerializer for INPUT validation but return the
+        # full read-shape OrderSerializer for OUTPUT — otherwise the
+        # response misses fields like `uuid`, `status`, `total_amount_cents`,
+        # etc., which the frontend needs.
+        #
+        # The default ModelViewSet.partial_update uses get_serializer_class
+        # for both directions, so a stripped write-only serializer leaks
+        # into the response. Mirrors the same workaround ProductViewSet
+        # uses (per CLAUDE.md "Backend response shape note").
+        instance = self.get_object()
+        write_serializer = self.get_serializer(instance, data=request.data, partial=True)
+        write_serializer.is_valid(raise_exception=True)
+        self.perform_update(write_serializer)
+        return Response(OrderSerializer(instance).data)
 
     # ----- lifecycle actions -----
 
