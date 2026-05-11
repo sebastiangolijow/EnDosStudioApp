@@ -263,8 +263,15 @@ def place_order(order: Order) -> Order:
         return order
 
 
-def transition_to_paid(order: Order, *, stripe_event: dict) -> Order:
-    """placed → paid. System action (Stripe webhook); no actor.
+def transition_to_paid(order: Order, *, stripe_event: dict | None = None, actor=None) -> Order:
+    """placed → paid.
+
+    Triggered in two ways:
+      1. Stripe webhook (system action, no actor) — pass `stripe_event`.
+      2. Manual admin "mark as paid" (staff handles payment out-of-band,
+         e.g. bank transfer / cash on pickup) — pass `actor=request.user`,
+         leave stripe_event as None. The Order's history row records
+         who flipped the switch.
 
     Side effects branch by kind:
       - sticker: generate the cut-path SVG so the printer has both the
@@ -287,7 +294,9 @@ def transition_to_paid(order: Order, *, stripe_event: dict) -> Order:
 
         order.status = "paid"
         order.paid_at = timezone.now()
-        order._history_user = None  # system action, no human actor
+        # System action when called from Stripe webhook (actor=None);
+        # human actor when called from the admin mark-paid endpoint.
+        order._history_user = actor
         order.save(update_fields=["status", "paid_at", "updated_at"])
 
     # Sticker-only side effect, after the lock releases. File IO outside

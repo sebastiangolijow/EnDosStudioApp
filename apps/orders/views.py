@@ -14,6 +14,7 @@ Endpoint surface:
   POST   /api/v1/orders/{uuid}/checkout/  → Stripe PaymentIntent (customer)
   POST   /api/v1/orders/{uuid}/cancel/    → cancelled (customer, only draft/placed)
   POST   /api/v1/orders/{uuid}/deliver/   → delivered (customer)
+  POST   /api/v1/orders/{uuid}/mark-paid/  placed → paid (staff, manual fallback when Stripe is out-of-band)
   POST   /api/v1/orders/{uuid}/start-production/  paid → in_production (staff)
   POST   /api/v1/orders/{uuid}/ship/      in_production → shipped (staff)
 
@@ -36,6 +37,7 @@ from rest_framework.views import APIView
 
 from apps.payments.services import StripeService
 
+from .filters import OrderFilter
 from .models import Order, OrderFile
 from .serializers import (
     CheckoutResponseSerializer,
@@ -53,6 +55,7 @@ from .services import (
     mark_delivered,
     place_order,
     transition_to_in_production,
+    transition_to_paid,
     transition_to_shipped,
 )
 from .services_smart_cut import (
@@ -76,14 +79,37 @@ class OrderViewSet(viewsets.ModelViewSet):
     Customers see/edit only their own orders. Staff see all orders. PATCH
     is the only allowed update verb (PUT not enabled). DELETE is disabled
     in favor of the cancel action.
+
+    Filtering/search/ordering wired for the admin orders screen:
+      - filterset_class    → status, kind, status_in, created_after/before,
+                             placed_after/before
+      - search_fields      → icontains across uuid + customer email/name +
+                             recipient_name (for "find this order by who"
+                             when a customer DMs the shop owner)
+      - ordering_fields    → created_at, placed_at, total_amount_cents
+      - default ordering   → newest first by created_at (most recent on top)
     """
 
     permission_classes = [IsAuthenticated]
     http_method_names = ["get", "post", "patch", "head", "options"]
     lookup_field = "pk"
+    filterset_class = OrderFilter
+    search_fields = [
+        "uuid",
+        "created_by__email",
+        "created_by__first_name",
+        "created_by__last_name",
+        "recipient_name",
+    ]
+    ordering_fields = ["created_at", "placed_at", "total_amount_cents"]
+    ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = Order.objects.all().prefetch_related("files")
+        # select_related on created_by so customer_email / customer_name
+        # in the serializer don't trigger N+1 lookups on list views with
+        # many orders (admin orders screen will routinely render 25-100
+        # rows at a time).
+        qs = Order.objects.all().select_related("created_by").prefetch_related("files")
         if _is_staff(self.request.user):
             return qs
         return qs.filter(created_by=self.request.user)
@@ -236,6 +262,28 @@ class OrderViewSet(viewsets.ModelViewSet):
         order = self.get_object()
         try:
             order = mark_delivered(order, actor=request.user)
+        except InvalidTransition as e:
+            return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
+        return Response(OrderSerializer(order).data)
+
+    @action(detail=True, methods=["post"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        """placed → paid. Staff-only.
+
+        Manual fallback for shop owners who handle payment out-of-band
+        (bank transfer, cash on pickup, etc.). Stripe webhook drives
+        the same transition via `payments/webhooks/stripe/`; this is
+        purely admin-triggered.
+
+        Side effects (cut-path SVG generation, stock decrement) are the
+        same as the Stripe path — `transition_to_paid` handles both
+        cases. History row records the staff user as the actor.
+        """
+        if not _is_staff(request.user):
+            raise PermissionDenied("Staff only.")
+        order = self.get_object()
+        try:
+            order = transition_to_paid(order, actor=request.user)
         except InvalidTransition as e:
             return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(order).data)

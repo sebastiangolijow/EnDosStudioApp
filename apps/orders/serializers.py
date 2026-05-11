@@ -51,6 +51,14 @@ class OrderSerializer(serializers.ModelSerializer):
     files = OrderFileSerializer(many=True, read_only=True)
     total_eur = serializers.SerializerMethodField()
     product_detail = ProductRefSerializer(source="product", read_only=True)
+    # Customer contact info — exposed so the admin orders screen can
+    # show "Pedido #abc · Sebastián Golijow · seba@example.com" at a
+    # glance without an extra fetch. Customers see their own info, so
+    # no privacy concern. SerializerMethodFields keep the fallbacks in
+    # one place (email when name is empty; pk when both are null
+    # because created_by got SET_NULL'd by a user delete).
+    customer_email = serializers.SerializerMethodField()
+    customer_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -80,6 +88,9 @@ class OrderSerializer(serializers.ModelSerializer):
             "city",
             "postal_code",
             "country",
+            # Customer
+            "customer_email",
+            "customer_name",
             # Money
             "total_amount_cents",
             "total_eur",
@@ -99,6 +110,8 @@ class OrderSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "uuid",
             "status",
+            "customer_email",
+            "customer_name",
             "total_amount_cents",
             "total_eur",
             "currency",
@@ -116,6 +129,20 @@ class OrderSerializer(serializers.ModelSerializer):
 
     def get_total_eur(self, obj) -> str:
         return f"{obj.total_amount_cents / 100:.2f}"
+
+    def get_customer_email(self, obj) -> str:
+        return obj.created_by.email if obj.created_by else ""
+
+    def get_customer_name(self, obj) -> str:
+        if not obj.created_by:
+            return ""
+        # get_full_name strips whitespace; falls back to email local-part
+        # so the UI always has SOMETHING to render.
+        full = obj.created_by.get_full_name()
+        if full:
+            return full
+        email = obj.created_by.email or ""
+        return email.split("@")[0] if email else ""
 
 
 class OrderUpdateSerializer(serializers.ModelSerializer):

@@ -1,6 +1,10 @@
 Django==4.2.*
 djangorestframework>=3.14,<3.15
 djangorestframework-simplejwt>=5.3,<6.0
+# django-filter — backend filter/search/ordering for the admin orders
+# screen. Adds ?status=paid, ?search=foo, ?ordering=-placed_at etc. on
+# top of any ViewSet that opts in via filter_backends.
+django-filter>=24.2,<25.0
 dj-rest-auth>=7.0,<8.0
 django-allauth>=65.0,<66.0
 django-cors-headers>=4.3,<5.0

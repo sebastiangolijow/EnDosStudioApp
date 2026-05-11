@@ -46,6 +46,7 @@ THIRD_PARTY_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
+    "django_filters",
     "corsheaders",
     "allauth",
     "allauth.account",
@@ -138,8 +139,18 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    # StandardPageNumberPagination supports ?page_size=N (capped at 100).
+    # ViewSets that need a different default still set their own paginator.
+    "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardPageNumberPagination",
     "PAGE_SIZE": 20,
+    # django-filter + DRF's built-in search + ordering filters wired
+    # globally. Individual ViewSets opt into them by setting
+    # filterset_class / filterset_fields / search_fields / ordering_fields.
+    "DEFAULT_FILTER_BACKENDS": (
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ),
 }
 
 SIMPLE_JWT = {
