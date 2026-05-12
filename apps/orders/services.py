@@ -428,7 +428,16 @@ def reserve_order(order: Order, *, actor, pickup_at) -> Order:
                 "updated_at",
             ]
         )
-        return order
+
+    # Notification emails — reservation path. Same shape as the paid
+    # path: customer gets a confirmation (with pickup_at), owner gets
+    # a heads-up so they can prep the bag + take cash on the day.
+    # Outside the transaction block so SMTP latency doesn't hold the
+    # row lock.
+    _send_order_received_to_customer(order)
+    _send_new_order_to_owner(order)
+
+    return order
 
 
 def transition_to_paid(order: Order, *, stripe_event: dict | None = None, actor=None) -> Order:
@@ -480,6 +489,13 @@ def transition_to_paid(order: Order, *, stripe_event: dict | None = None, actor=
             logging.getLogger(__name__).exception(
                 "Failed to generate cut_path for order %s: %s", order.uuid, exc,
             )
+
+    # Notification emails — paid path. Customer gets a confirmation;
+    # owner gets a heads-up. Both swallow their own SMTP errors so
+    # this never blocks an otherwise-successful paid transition.
+    _send_order_received_to_customer(order)
+    _send_new_order_to_owner(order)
+
     return order
 
 
@@ -684,6 +700,155 @@ def _send_shipping_notification(order: Order) -> None:
     except Exception as exc:  # noqa: BLE001 — third-party / SMTP errors
         logger.warning(
             "Shipping notification email failed for order %s: %s",
+            order.uuid,
+            exc,
+        )
+
+
+def _send_order_received_to_customer(order: Order) -> None:
+    """Confirmation email to the customer after their order is committed.
+
+    Triggers from two paths:
+      - transition_to_paid (Stripe webhook): "received + paid online"
+      - reserve_order: "received + reserved for in-store pickup"
+
+    Both render with the same template but branch the body on
+    order.status so the reservation copy mentions the pickup date.
+    Synchronous send; SMTP failures are logged but never raised.
+    """
+    from django.conf import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    recipient = order.shipping_email or (
+        order.created_by.email if order.created_by_id else ""
+    )
+    if not recipient:
+        logger.warning(
+            "Order-received email skipped for order %s — no recipient email.",
+            order.uuid,
+        )
+        return
+
+    short_uuid = str(order.uuid)[:8]
+    is_reserved = order.status == "reserved"
+
+    if is_reserved:
+        pickup_line = ""
+        if order.pickup_at:
+            pickup_line = (
+                f"Fecha de retiro: {order.pickup_at.strftime('%d/%m/%Y %H:%M')}\n"
+                f"Pago: en efectivo, al retirar\n\n"
+            )
+        body = (
+            f"¡Hola!\n\n"
+            f"Recibimos tu reserva #{short_uuid}.\n\n"
+            f"{pickup_line}"
+            f"Te esperamos en la tienda. Si necesitás reprogramar, "
+            f"escribinos a {settings.SHOP_OWNER_EMAIL}.\n\n"
+            f"Gracias por elegir nuestro taller.\n"
+        )
+        subject = f"Reservamos tu pedido #{short_uuid}"
+    else:
+        body = (
+            f"¡Hola!\n\n"
+            f"Recibimos tu pedido #{short_uuid} y ya está confirmado.\n\n"
+            f"Total pagado: €{order.total_eur if hasattr(order, 'total_eur') else (order.total_amount_cents / 100):.2f}\n\n"
+            f"Te avisaremos por email cuando entre en producción y de nuevo cuando lo enviemos.\n\n"
+            f"Gracias por elegir nuestro taller.\n"
+        )
+        subject = f"Recibimos tu pedido #{short_uuid}"
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@stickerapp.local"),
+            recipient_list=[recipient],
+            fail_silently=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Order-received email failed for order %s: %s",
+            order.uuid,
+            exc,
+        )
+
+
+def _send_new_order_to_owner(order: Order) -> None:
+    """Notify the shop owner that a new order landed.
+
+    Triggers from the same paths as the customer email
+    (transition_to_paid + reserve_order). Sends to settings
+    .SHOP_OWNER_EMAIL with enough detail that the owner doesn't
+    need to open the admin to know what arrived: order ID, customer
+    name, total, kind (sticker / catalog), and pickup info when
+    relevant.
+    """
+    from django.conf import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    recipient = getattr(settings, "SHOP_OWNER_EMAIL", "")
+    if not recipient:
+        logger.warning(
+            "Owner notification skipped for order %s — SHOP_OWNER_EMAIL not configured.",
+            order.uuid,
+        )
+        return
+
+    short_uuid = str(order.uuid)[:8]
+    is_reserved = order.status == "reserved"
+    customer_name = (
+        order.recipient_name
+        or (order.created_by.get_full_name() if order.created_by_id else "")
+        or "—"
+    )
+    customer_email = (
+        order.created_by.email if order.created_by_id else order.shipping_email
+    ) or "—"
+    kind_label = "Catálogo" if order.kind == "catalog" else "Sticker"
+    total_eur = order.total_amount_cents / 100
+
+    if is_reserved:
+        pickup_line = ""
+        if order.pickup_at:
+            pickup_line = (
+                f"Retiro: {order.pickup_at.strftime('%d/%m/%Y %H:%M')} "
+                f"(en efectivo, al retirar)\n"
+            )
+        body = (
+            f"Nueva reserva #{short_uuid}\n\n"
+            f"Cliente: {customer_name} <{customer_email}>\n"
+            f"Tipo: {kind_label}\n"
+            f"Total: €{total_eur:.2f}\n"
+            f"{pickup_line}"
+            f"\nGestioná en /admin/orders/{order.uuid}\n"
+        )
+        subject = f"[Reserva] #{short_uuid} — {customer_name}"
+    else:
+        body = (
+            f"Nuevo pedido pagado #{short_uuid}\n\n"
+            f"Cliente: {customer_name} <{customer_email}>\n"
+            f"Tipo: {kind_label}\n"
+            f"Total: €{total_eur:.2f}\n\n"
+            f"Gestioná en /admin/orders/{order.uuid}\n"
+        )
+        subject = f"[Pedido pagado] #{short_uuid} — {customer_name}"
+
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@stickerapp.local"),
+            recipient_list=[recipient],
+            fail_silently=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Owner notification email failed for order %s: %s",
             order.uuid,
             exc,
         )

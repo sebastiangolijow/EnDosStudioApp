@@ -201,6 +201,9 @@ EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="noreply@stickerapp.local")
+# Recipient for new-order notifications. Falls back to DEFAULT_FROM_EMAIL
+# so dev / test environments don't fail loud on empty config.
+SHOP_OWNER_EMAIL = env("SHOP_OWNER_EMAIL", default=DEFAULT_FROM_EMAIL)
 
 # === Frontend ===
 FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:5173")
