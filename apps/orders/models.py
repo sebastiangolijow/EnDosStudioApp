@@ -84,6 +84,11 @@ SHAPE_CHOICES = [
     ("cuadrado", _("Cuadrado")),
     ("circulo", _("Círculo")),
     ("redondeadas", _("Esquinas redondeadas")),
+    # Wide oval — fixed 2:1 horizontal aspect regardless of the source
+    # image's dimensions. Distinct from circulo (which fits an ellipse
+    # to the image bounds and on a non-square image already becomes
+    # oval-shaped); this is a deliberate "ID badge" / "racetrack" shape.
+    ("oval", _("Óvalo")),
 ]
 
 # Shipping method — drives a multiplicative surcharge on the order total
