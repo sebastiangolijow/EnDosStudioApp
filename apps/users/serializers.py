@@ -20,6 +20,7 @@ class UserSerializer(serializers.ModelSerializer):
             "role",
             "is_active",
             "is_verified",
+            "can_reserve_orders",
             "created_at",
         ]
         read_only_fields = [
@@ -27,8 +28,20 @@ class UserSerializer(serializers.ModelSerializer):
             "role",
             "is_active",
             "is_verified",
+            "can_reserve_orders",
             "created_at",
         ]
+
+
+class AdminUserWriteSerializer(serializers.ModelSerializer):
+    """Staff-only PATCH. Whitelisted fields are the only thing the
+    shop owner edits from the admin users page — currently just the
+    `can_reserve_orders` flag. Add fields here as the admin surface
+    grows (e.g. flipping `is_active` to ban an account)."""
+
+    class Meta:
+        model = User
+        fields = ["can_reserve_orders"]
 
 
 class RegisterSerializer(serializers.Serializer):

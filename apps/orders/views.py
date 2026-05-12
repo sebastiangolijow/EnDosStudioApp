@@ -54,6 +54,7 @@ from .services import (
     compute_total_cents,
     mark_delivered,
     place_order,
+    reserve_order,
     transition_to_in_production,
     transition_to_paid,
     transition_to_shipped,
@@ -183,6 +184,35 @@ class OrderViewSet(viewsets.ModelViewSet):
         except InvalidTransition as e:
             return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         except InvalidPricingInput as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def reserve(self, request, pk=None):
+        """Customer-only. Reserve the order for in-store pickup.
+
+        Requires the requesting user to be whitelisted via
+        `can_reserve_orders`. Body: `{pickup_at: ISO 8601 datetime}`.
+        The owner takes cash at pickup and transitions the order to
+        'paid' via admin-set-status afterwards.
+        """
+        if not getattr(request.user, "can_reserve_orders", False):
+            return Response(
+                {"detail": "Tu cuenta no tiene habilitada la reserva."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        pickup_at = request.data.get("pickup_at")
+        if not pickup_at:
+            return Response(
+                {"detail": "pickup_at is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order = self.get_object()
+        try:
+            order = reserve_order(order, actor=request.user, pickup_at=pickup_at)
+        except InvalidTransition as e:
+            return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
+        except (InvalidPricingInput, ValueError) as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 

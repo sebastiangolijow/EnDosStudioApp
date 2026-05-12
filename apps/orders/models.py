@@ -37,6 +37,10 @@ MAX_QUANTITY = 100_000
 STATUS_CHOICES = [
     ("draft", _("Draft")),
     ("placed", _("Placed")),
+    # In-store pickup reservation. Whitelisted customers can transition
+    # placed → reserved instead of paying online; the owner manually
+    # marks paid when cash changes hands at pickup.
+    ("reserved", _("Reserved for pickup")),
     ("paid", _("Paid")),
     ("in_production", _("In production")),
     ("shipped", _("Shipped")),
@@ -241,10 +245,16 @@ class Order(BaseModel):
 
     # Lifecycle timestamps (set by service functions)
     placed_at = models.DateTimeField(_("placed at"), null=True, blank=True)
+    reserved_at = models.DateTimeField(_("reserved at"), null=True, blank=True)
     paid_at = models.DateTimeField(_("paid at"), null=True, blank=True)
     shipped_at = models.DateTimeField(_("shipped at"), null=True, blank=True)
     delivered_at = models.DateTimeField(_("delivered at"), null=True, blank=True)
     cancelled_at = models.DateTimeField(_("cancelled at"), null=True, blank=True)
+
+    # When the customer plans to pick up a reserved order. Set by the
+    # /reserve/ endpoint, surfaced in the admin order detail right rail
+    # so the owner knows when to expect them.
+    pickup_at = models.DateTimeField(_("pickup at"), null=True, blank=True)
 
     history = HistoricalRecords(
         history_user_id_field=models.UUIDField(null=True, blank=True),

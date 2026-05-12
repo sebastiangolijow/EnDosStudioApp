@@ -334,6 +334,103 @@ def place_order(order: Order) -> Order:
         return order
 
 
+def reserve_order(order: Order, *, actor, pickup_at) -> Order:
+    """{draft, placed} → reserved. Whitelist-gated alternative to Stripe.
+
+    The customer commits to picking up + paying cash in-store at
+    `pickup_at`. Mirrors place_order's fill-validation so the order is
+    production-ready by the time the owner takes payment.
+
+    Caller must verify `actor.can_reserve_orders` before invoking — the
+    view enforces this; this function trusts its caller.
+    """
+    from datetime import datetime as _datetime, timezone as _dt_timezone
+
+    _require_owner(order, actor)
+
+    # Accept ISO datetime strings (from JSON body) or pre-parsed datetime
+    # objects (from internal callers / tests). Naive strings are
+    # interpreted as UTC to match Django's USE_TZ=True convention.
+    if isinstance(pickup_at, str):
+        parsed = _datetime.fromisoformat(pickup_at.replace("Z", "+00:00"))
+    elif isinstance(pickup_at, _datetime):
+        parsed = pickup_at
+    else:
+        raise InvalidPricingInput(f"pickup_at must be a datetime, got {type(pickup_at)!r}")
+
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, _dt_timezone.utc)
+
+    if parsed <= timezone.now():
+        raise InvalidPricingInput("pickup_at must be in the future.")
+
+    with transaction.atomic():
+        order = _lock(order)
+        if order.status not in {"draft", "placed"}:
+            raise InvalidTransition(
+                f"Cannot reserve order in status {order.status!r}."
+            )
+
+        # Same fill-validation as place_order — a reserved order still
+        # needs the spec and shipping fields so production can start.
+        if order.kind == KIND_STICKER:
+            missing = _validate_sticker_required(order)
+        elif order.kind == KIND_CATALOG:
+            missing = _validate_catalog_required(order)
+        else:
+            raise InvalidTransition(f"Unknown order kind {order.kind!r}.")
+
+        for field in (
+            "recipient_name",
+            "street_line_1",
+            "city",
+            "postal_code",
+            "country",
+            "shipping_phone",
+        ):
+            if not getattr(order, field):
+                missing.append(field)
+        if missing:
+            raise InvalidTransition(
+                f"Cannot reserve order; missing: {', '.join(missing)}."
+            )
+
+        # Compute the total now too — owner takes cash for this amount.
+        if order.kind == KIND_STICKER:
+            order.total_amount_cents = compute_total_cents(
+                material=order.material,
+                width_mm=order.width_mm,
+                height_mm=order.height_mm,
+                quantity=order.quantity,
+                with_relief=order.with_relief,
+                with_tinta_blanca=order.with_tinta_blanca,
+                with_barniz_brillo=order.with_barniz_brillo,
+                with_barniz_opaco=order.with_barniz_opaco,
+                shipping_method=order.shipping_method,
+            )
+        else:
+            order.total_amount_cents = _compute_catalog_total_cents(order)
+
+        order.status = "reserved"
+        order.pickup_at = parsed
+        now = timezone.now()
+        order.reserved_at = now
+        if order.placed_at is None:
+            order.placed_at = now
+        order._history_user = actor
+        order.save(
+            update_fields=[
+                "status",
+                "pickup_at",
+                "reserved_at",
+                "placed_at",
+                "total_amount_cents",
+                "updated_at",
+            ]
+        )
+        return order
+
+
 def transition_to_paid(order: Order, *, stripe_event: dict | None = None, actor=None) -> Order:
     """placed → paid.
 
@@ -464,6 +561,7 @@ def cancel_order(order: Order, *, actor, reason: str = "") -> Order:
 
 _STATUS_TIMESTAMP_FIELD = {
     "placed": "placed_at",
+    "reserved": "reserved_at",
     "paid": "paid_at",
     "shipped": "shipped_at",
     "delivered": "delivered_at",

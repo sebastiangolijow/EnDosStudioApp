@@ -1,13 +1,19 @@
 import logging
 
-from rest_framework import generics, status
+from django.db.models import Q
+from rest_framework import generics, mixins, status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import User
 from .permissions import IsAdminOrShopStaff
-from .serializers import RegisterSerializer, SetPasswordSerializer, UserSerializer
+from .serializers import (
+    AdminUserWriteSerializer,
+    RegisterSerializer,
+    SetPasswordSerializer,
+    UserSerializer,
+)
 from .services import send_verification_email
 
 logger = logging.getLogger(__name__)
@@ -122,3 +128,62 @@ class SetPasswordView(APIView):
             {"detail": "Password set. You can now log in.", "user": UserSerializer(user).data},
             status=status.HTTP_200_OK,
         )
+
+
+class AdminUserViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Staff-only user management.
+
+    Powers the /admin/users frontend page where the shop owner toggles
+    `can_reserve_orders` on trusted customers. Lookup uses uuid (matches
+    the rest of the API surface).
+
+    Filters:
+      - ?search=foo         icontains over email + first_name + last_name.
+      - ?can_reserve_orders=true|false     boolean filter.
+      - ?role=customer|shop_staff|admin    role filter.
+    """
+
+    permission_classes = [IsAdminOrShopStaff]
+    queryset = User.objects.all().order_by("email")
+    lookup_field = "uuid"
+
+    def get_serializer_class(self):
+        if self.action in {"update", "partial_update"}:
+            return AdminUserWriteSerializer
+        return UserSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        search = params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(email__icontains=search)
+                | Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+            )
+        can_reserve = params.get("can_reserve_orders")
+        if can_reserve is not None:
+            if can_reserve.lower() in {"true", "1", "yes"}:
+                qs = qs.filter(can_reserve_orders=True)
+            elif can_reserve.lower() in {"false", "0", "no"}:
+                qs = qs.filter(can_reserve_orders=False)
+        role = params.get("role")
+        if role:
+            qs = qs.filter(role=role)
+        return qs
+
+    def update(self, request, *args, **kwargs):
+        """Return the full read shape after a PATCH so the admin table
+        can splice the row in place without a follow-up GET."""
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(UserSerializer(serializer.instance).data)

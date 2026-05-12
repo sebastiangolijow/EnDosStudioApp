@@ -145,10 +145,14 @@ class OrderSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "placed_at",
+            "reserved_at",
             "paid_at",
             "shipped_at",
             "delivered_at",
             "cancelled_at",
+            # In-store pickup reservation — when the customer plans
+            # to come collect + pay cash.
+            "pickup_at",
         ]
         read_only_fields = [
             "uuid",

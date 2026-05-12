@@ -72,6 +72,13 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_staff = models.BooleanField(_("is staff"), default=False)
     is_verified = models.BooleanField(_("email verified"), default=False)
 
+    # Whitelist gate for in-store pickup reservations. Off by default
+    # — only customers the shop owner explicitly trusts (cash regulars)
+    # get the Reserve CTA at checkout. Managed via the admin users page.
+    can_reserve_orders = models.BooleanField(
+        _("can reserve orders"), default=False
+    )
+
     # Email verification token (for set-password / verify flows)
     verification_token = models.CharField(max_length=100, blank=True)
     verification_token_created_at = models.DateTimeField(null=True, blank=True)
