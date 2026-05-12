@@ -35,17 +35,40 @@ class ProductRefSerializer(serializers.ModelSerializer):
     """Tiny embed of a Product on Order.product_detail.
 
     Just enough for the frontend to render the catalog summary without a
-    second fetch.
+    second fetch. Includes the discounted price so the strikethrough
+    rendering on /checkout matches the catalog detail page.
     """
 
     price_eur = serializers.SerializerMethodField()
+    sale_price_eur = serializers.SerializerMethodField()
+    effective_price_cents = serializers.IntegerField(read_only=True)
+    effective_price_eur = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
-        fields = ["uuid", "name", "slug", "image", "price_cents", "price_eur"]
+        fields = [
+            "uuid",
+            "name",
+            "slug",
+            "image",
+            "price_cents",
+            "price_eur",
+            "sale_price_cents",
+            "sale_price_eur",
+            "effective_price_cents",
+            "effective_price_eur",
+        ]
 
     def get_price_eur(self, obj) -> str:
         return f"{obj.price_cents / 100:.2f}"
+
+    def get_sale_price_eur(self, obj) -> str | None:
+        if not obj.sale_price_cents:
+            return None
+        return f"{obj.sale_price_cents / 100:.2f}"
+
+    def get_effective_price_eur(self, obj) -> str:
+        return f"{obj.effective_price_cents / 100:.2f}"
 
 
 class OrderSerializer(serializers.ModelSerializer):
