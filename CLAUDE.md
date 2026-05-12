@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status**: M1 (bootstrap) + M2 (orders/payments backend, customer/staff API, Stripe checkout flow, auth gate) + M3a in progress (frontend SPA shipped, cut-path SVG generation, shape field, repricing 2026-05-09 — area×qty×material formula with additive % add-ons + 20€ floor, catalog products + Order.kind 2026-05-09, **AI background removal via rembg 2026-05-09 — repriced + perf-rewritten 2026-05-10 (~2.3s warm vs ~10-15s before, scipy dilation + 512px downsample + Gaussian smoothing + boot-time rembg warmup, plus PATCH response-shape bug fix)**). Live Stripe keys + email SMTP + first deploy are the remaining blockers to a real first transaction.
+> **Status (EOD 2026-05-12)**: M1 + M2 + M3 shipped — orders / payments / catalog / smart-cut / cut-path SVG / shape field + Oval / shipping_method + IVA pricing / shipping contact fields + admin force-status with shipping email / customer order-received emails / owner new-order email / **reservations with whitelist** (in-store pickup, Order.pickup_at) / **discounts** (Discount model + apply-discount endpoint + pricing pipeline) / product sale_price + weight_grams + category / public catalog respects ?is_active=true. 187 backend tests passing. Live Stripe keys + production SMTP + first deploy remain the operational blockers.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -142,19 +142,35 @@ That's the MVP. Anything beyond it (rebates, discount codes, multi-shop, admin U
 
 ---
 
-## 🧱 Apps structure (planned, will be created by the bootstrap skill)
+## 🧱 Apps structure (current as of 2026-05-12)
 
 ```
 apps/
 ├── core/         # BaseModel mixins, permissions, custom managers, common utils
-├── users/        # User model, auth flows, registration, email verification
-├── orders/       # Order model, OrderFile (uploads), order status transitions, services
+├── users/        # User model (+ can_reserve_orders whitelist flag),
+│                 # auth flows, registration (phone_number required),
+│                 # email verification, set-password,
+│                 # AdminUserViewSet (staff list + PATCH for whitelist toggle)
+├── orders/       # Order model (status enum includes 'reserved'; pickup_at,
+│                 # discount_code, discount_cents, shipping_carrier/_tracking/_eta,
+│                 # shipping_method, shipping_phone/_email), OrderFile (uploads),
+│                 # status transitions (place / reserve / mark-paid / shipped /
+│                 # admin-set-status / apply-discount), services (pricing pipeline,
+│                 # email notifications), simple_history audit
 ├── payments/     # Stripe integration: PaymentIntent, webhooks, payment records
-└── products/     # Catalog products (M3a). Llaveros etc. — non-sticker items
-                  # bought via catalog Orders (Order.kind="catalog").
+├── products/     # Catalog products (sale_price_cents, weight_grams, category FK)
+│                 # + Category model + ProductRefSerializer (embedded on Order)
+└── discounts/    # NEW (2026-05-12). Discount(code unique upper, percent_off 1-100,
+                  # is_enabled). DiscountViewSet staff-only CRUD.
+                  # Applied to Orders via apps.orders.views.apply_discount.
 ```
 
-No `notifications/` app on day 1 — Django's `send_mail` straight from a service is enough. Add an app when there's a real notification surface (templates, scheduling, multi-channel).
+No `notifications/` app on day 1 — Django's `send_mail` straight from
+a service function is enough. The three email workflows
+(`_send_order_received_to_customer`, `_send_new_order_to_owner`,
+`_send_shipping_notification`) live in `apps/orders/services.py`. Add
+a dedicated app when there's a real notification surface (HTML
+templates, scheduling, multi-channel).
 
 No `analytics/` app on day 1 — admin views + Postgres queries cover it for an SMB.
 
@@ -162,22 +178,156 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 
 ## 🚧 Status
 
-### Pick up here tomorrow (open thread from EOD 2026-05-10)
+### Pick up here tomorrow (EOD 2026-05-12)
 
-The smart-cut gorilla bug from 2026-05-09 is RESOLVED. Smart-cut now
-runs at ~2.3s warm (vs ~10-15s before) with proper bleed-margin
-dilation, Gaussian smoothing, and per-customer-pose RGB-preserving
-bleed ring.
+**No open thread — session ended green.** 187 backend tests passing
+(0 failures, 0 errors). Everything pushed to `main`. The remaining
+operational blockers (real Stripe keys, prod SMTP creds, first deploy)
+are configuration tasks, not code.
 
-The next pickup item is **frontend-side, not backend**: the WebGL
-holographic FX layer overlays its iridescent rainbow over the bleed
-area's source-RGB pixels. Customer wants the holographic to TINT the
-existing background (e.g. teal stays teal but shimmers), not to
-replace it. Three fix candidates documented in
-`endosstudio_frontend/CLAUDE.md` "Pick up here tomorrow" section.
+If picking up next:
+- **Cut-path SVG download in admin UI** — file is already generated
+  at `transition_to_paid` (apps/orders/cut_path.py). Admin order
+  detail screen could surface a download link. ~10 LOC frontend.
+- **Smart-cut leaf-bridge tendrils** — the 2026-05-09 issue with
+  morphological opening on rembg output may resurface on artwork
+  with thin bridges between regions. Fix candidates documented in
+  the 2026-05-09 entry below.
+- **Real shipping notification email content** — currently plain text.
+  HTML template + the shop's logo would polish the impression.
 
-**No uncommitted backend work.** Everything from session 2026-05-10 is
-on `main` and pushed.
+### Done (Session 2026-05-12 — operational polish + reservations + discounts + emails)
+
+Big session shipped end-to-end:
+
+**A. IVA + pricing pipeline overhaul**
+- New `IVA_RATE = Decimal("0.21")` constant in services.py. Pricing
+  pipeline now: `work × addons × shipping → floor at €20 → discount
+  → ×1.21 IVA`. `compute_total_cents` accepts optional
+  `discount_percent`; `_compute_breakdown` returns the components
+  (`pre_discount_cents`, `discount_cents`, `pre_iva_cents`,
+  `total_with_iva_cents`) for callers that need the discount amount
+  alongside the total.
+- New helpers: `subtotal_cents_of(total)` / `iva_cents_of(total)`
+  reverse-derive the breakdown from `total_amount_cents` for the
+  OrderSerializer's display fields.
+- Catalog products use the same discount-before-IVA logic via
+  `_compute_catalog_total_cents` + `_discount_percent_for_order`.
+  No €20 floor on catalog (each product has its own price).
+- Single source of truth: `_recompute_order_total(order)` is called
+  from `place_order`, `reserve_order`, and `apply_discount_to_order`
+  so totals can't drift between code paths.
+
+**B. New apps/discounts/ app**
+- `Discount(code unique upper, percent_off 1..100, is_enabled,
+  history)`. Code is normalized to UPPER inside `save()` so admins
+  can type 'summer2026' and customers can submit 'Summer2026' and
+  both resolve to 'SUMMER2026'. Disabled codes are kept (don't
+  delete) so past orders that used them keep their audit trail.
+- `DiscountViewSet` — staff-only CRUD at `/api/v1/discounts/`.
+  `IsAdminOrShopStaff` permission.
+- Wired into `config/urls.py` and `LOCAL_APPS`.
+- 8 tests in `apps/discounts/tests/test_discount_admin_api.py`.
+
+**C. Reservations (Order.status='reserved')**
+- New `'reserved'` choice between `'placed'` and `'paid'` in
+  STATUS_CHOICES. Lifecycle: draft → placed → reserved → paid →
+  in_production → shipped → delivered.
+- `Order.pickup_at: datetime?` + `Order.reserved_at: datetime?`.
+- `User.can_reserve_orders: bool` whitelist gate.
+- `POST /orders/{uuid}/reserve/` — customer-only. Body
+  `{pickup_at: ISO 8601}`. Requires `request.user.can_reserve_orders`,
+  validates `pickup_at > now()`, runs the same fill-validation
+  `place_order` does, computes the total + discount, stamps
+  `reserved_at` + `placed_at` (if null) + `pickup_at`.
+- `_STATUS_TIMESTAMP_FIELD` extended with `"reserved": "reserved_at"`
+  so `admin_set_order_status` stamps it correctly.
+- New `apps/users/views.AdminUserViewSet` for `/api/v1/users/`
+  (staff list + PATCH). PATCH accepts only `can_reserve_orders`.
+- 9 tests covering whitelist gate, past-datetime rejection,
+  me-endpoint extension, admin list + PATCH + customer-blocked PATCH.
+
+**D. Admin force-status + shipping email**
+- `POST /orders/{uuid}/admin-set-status/` — staff-only. Body
+  `{status, shipping_carrier?, shipping_tracking_code?,
+  shipping_eta_date?}`. Bypasses the usual transition guards.
+  Stamps the matching `*_at` timestamp.
+- When `status='shipped'` AND a tracking code is provided, persists
+  the carrier/tracking/ETA on the order AND fires
+  `_send_shipping_notification` (plain-text email to the customer
+  with carrier name + tracking code + ETA).
+- `Order` gains `shipping_carrier`, `shipping_tracking_code`,
+  `shipping_eta_date`.
+- New `GET /orders/shipping-carriers/` — staff-only, returns
+  `DISTINCT shipping_carrier` from past orders. Drives the admin
+  popup's autosuggest.
+- 10 tests in `apps/orders/tests/test_admin_set_status.py`.
+
+**E. Customer + owner order-received emails**
+- `_send_order_received_to_customer(order)` fires from
+  `transition_to_paid` AND `reserve_order`. Subject branches by
+  status (paid vs reserved); reservation body includes
+  `pickup_at` + "en efectivo, al retirar".
+- `_send_new_order_to_owner(order)` — same trigger paths. Sends to
+  the new `settings.SHOP_OWNER_EMAIL` env var (falls back to
+  `DEFAULT_FROM_EMAIL`). Body includes recipient name + email,
+  total, kind, pickup info for reservations.
+- Both synchronous via Django's default email backend. SMTP failures
+  are logged but never raised — losing an email can't unwind a
+  successful order transition. Top-level `send_mail` import (not
+  function-scoped) so tests can `mock.patch("apps.orders.services.send_mail")`.
+- 8 tests in `apps/orders/tests/test_order_emails.py`.
+
+**F. Shipping method + contact fields**
+- `Order.shipping_method ∈ {normal, express, flash}`, with `+0%/+20%/+60%`
+  surcharges that stack into the existing `addon_multiplier`.
+- `Order.shipping_phone` (required at place_order — model layer
+  `default=""` so the change is non-disruptive, but place_order's
+  fill-validation rejects empty values), `Order.shipping_email`
+  (optional).
+- `RegisterSerializer.phone_number = serializers.CharField(...)` —
+  required on new signups. Existing User rows with blank phones
+  remain valid (model-level field stays blankable for migration safety).
+
+**G. Product enrichment**
+- `Product.sale_price_cents` (nullable) — when set, supersedes
+  `price_cents` via `effective_price_cents` property. Catalog UI
+  shows strikethrough + discounted price.
+- `Product.weight_grams` (nullable) — captured now so a future
+  weight-aware shipping rate is a data change, not a migration.
+- `Product.category = FK(Category, SET_NULL)` — new
+  `apps/products/Category` model. ProductWriteSerializer accepts
+  `category` as free text; dedupes by slug via `update_or_create`.
+- Public catalog `?is_active=true` filter now honored EVEN for staff
+  visitors (Frontend always passes it from `/catalogo`; admin
+  product list at `/admin/products` skips it to see everything).
+- `ProductRefSerializer` (the embed on `Order.product_detail`)
+  carries `sale_price_cents` + `effective_price_cents` so the
+  checkout summary renders the strikethrough without a second fetch.
+
+**H. Order shape: 'oval'**
+- Fifth Shape choice between `redondeadas` and... well, last in the
+  list. Frontend renders it at a fixed 2:1 horizontal aspect
+  (deliberately distinct from `circulo` which fits the image's
+  aspect). Backend just accepts the value; no special handling.
+- Frontend: drag-to-move support for ALL geometric shapes
+  (cuadrado / circulo / oval / redondeadas) via image-natural-pixel
+  offset. Backend stores the resulting polygon in OrderFile if/when
+  the customer hits Continuar; the offset itself is editor-session
+  state and not persisted.
+
+**I. Tests**
+- 187 passing total, up from 137 at session start (+50 new tests
+  across: shipping_pricing (gold standard repriced for IVA), catalog
+  lifecycle, admin_set_status, reserve, admin_users_api, order_emails,
+  apply_discount, discount_admin_api).
+- The gold-standard scenarios in the regression suite:
+  - `vinilo_blanco 10×10 q=100`: pre-IVA 5951 cents → ×1.21 = **7201 cents** (was 5951).
+  - With `+relief +brillo`: pre-IVA 9224 → ×1.21 = **11161 cents** (was 9224).
+  - With WELCOME10 (10% off, no add-ons): pre-discount 5951 → discount 595 → pre-IVA 5356 → ×1.21 = **6481 cents**.
+  - Catalog €15 product × 1, no add-ons → ×1.21 = **1815 cents**.
+
+### Local dev caveat: rembg in the running container is ephemeral
 
 ### Local dev caveat: rembg in the running container is ephemeral
 
@@ -569,19 +719,26 @@ parts:
 - `whitenoise` moved from `prod.txt` to `base.txt` (settings reference its middleware unconditionally; dev tests need it loadable).
 
 ### Next (Milestone 3 — first real transaction)
-The backend + frontend are feature-complete for the MVP loop. The
-remaining blockers are operational:
+The backend + frontend are feature-complete for the MVP loop AND
+for the reservation / discount / multi-email workflows. Remaining
+blockers are operational:
 
 1. **Stripe account + test keys**. Drop `STRIPE_PUBLISHABLE_KEY`,
    `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` into `.env`. End-to-end
    test with
    `stripe listen --forward-to localhost:8000/api/v1/payments/webhooks/stripe/`.
    Until then, `POST /api/v1/orders/{uuid}/checkout/` returns 502 and
-   the frontend mocks the Stripe layer in dev.
-2. **Email backend for verification + password reset**. SMTP env vars
-   already wired (`EMAIL_HOST`, `EMAIL_HOST_USER`, ...) but no real
-   provider configured. Pick Gmail SMTP / SES / Mailgun and ship the
-   credentials.
+   the frontend mocks the Stripe layer in dev. Note that the
+   **reservation path bypasses Stripe entirely** — that's already
+   working end-to-end for whitelisted customers.
+2. **Email backend for production**. Five email surfaces depend on
+   it: verification, password reset, customer order-received,
+   owner new-order notification, customer shipping tracking. SMTP
+   env vars wired (`EMAIL_HOST`, `EMAIL_HOST_USER`, …) +
+   `SHOP_OWNER_EMAIL` (added 2026-05-12) but no real provider
+   configured. Pick Gmail SMTP / SES / Mailgun and ship the
+   credentials. Until then, the console backend prints emails to
+   the Django logs in dev — you can verify content end-to-end.
 3. **First deploy**. `docker-compose.prod.yml` is wired; needs a
    hosting choice, domain, TLS, and the SMTP creds from (2).
 
@@ -618,8 +775,14 @@ record so we don't relitigate from scratch next time.
 ### Email provider for prod (`EMAIL_BACKEND` + SMTP creds)
 
 - **Status**: open. Backend uses SMTP env vars (`EMAIL_HOST`,
-  `EMAIL_HOST_USER`, …) but no real provider configured. `RegisterView`
-  + password reset both depend on this; can't ship customers without it.
+  `EMAIL_HOST_USER`, …) but no real provider configured.
+  `RegisterView` + password reset + the three new email workflows
+  (customer order-received, owner new-order, customer shipping
+  tracking — all shipped 2026-05-12) depend on this. Console
+  backend is the dev default; emails print to logs.
+- **`SHOP_OWNER_EMAIL` env var** (added 2026-05-12) — owner
+  notifications go here. Falls back to `DEFAULT_FROM_EMAIL` when
+  blank. Both `.env` and `.env.example` carry placeholder values.
 - **Recommendation**: **Gmail SMTP** for M3. Cheapest path to
   "customers can self-register". `App password` on a yeko@gmail or
   shop@gmail account. Move to SES or Mailgun once volume goes past
