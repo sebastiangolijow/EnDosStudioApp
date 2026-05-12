@@ -80,6 +80,15 @@ TINTA_BLANCA_SURCHARGE_PCT = Decimal("0.35")
 BARNIZ_BRILLO_SURCHARGE_PCT = Decimal("0.20")
 BARNIZ_OPACO_SURCHARGE_PCT = Decimal("0.20")
 
+# Shipping surcharges — same multiplicative stacking as the add-ons.
+# Normal adds 0 (default speed). Express +20% (2-3 days). Flash +60%
+# (next-day). Mutually exclusive by enum; only one applies.
+SHIPPING_SURCHARGE_PCT = {
+    "normal": Decimal("0.00"),
+    "express": Decimal("0.20"),
+    "flash": Decimal("0.60"),
+}
+
 ADMIN_ROLES = {"admin", "shop_staff"}
 
 
@@ -105,11 +114,17 @@ def compute_total_cents(
     with_tinta_blanca: bool = False,
     with_barniz_brillo: bool = False,
     with_barniz_opaco: bool = False,
+    shipping_method: str = "normal",
 ) -> int:
     """Pure pricing function. Decimal-based math, integer cents at the boundary.
 
     Validates the same constraints place_order enforces: known material,
     width/height multiples of 5 mm and >= 25 mm, quantity in [20, 100000].
+
+    shipping_method stacks as another additive multiplier alongside the
+    add-on surcharges: normal +0%, express +20%, flash +60%. Default
+    'normal' so existing callers that don't pass it are unchanged.
+    Unknown methods raise InvalidPricingInput.
     """
     if material not in MATERIAL_PRICE_CENTS:
         raise InvalidPricingInput(f"Unknown material: {material!r}")
@@ -127,6 +142,8 @@ def compute_total_cents(
             f"quantity={quantity} outside allowed range "
             f"[{MIN_QUANTITY}, {MAX_QUANTITY}]"
         )
+    if shipping_method not in SHIPPING_SURCHARGE_PCT:
+        raise InvalidPricingInput(f"Unknown shipping_method: {shipping_method!r}")
 
     # Area in m² including the 15 mm bleed margin on each side.
     bleed = Decimal(BLEED_MARGIN_MM)
@@ -145,6 +162,7 @@ def compute_total_cents(
         multiplier += BARNIZ_BRILLO_SURCHARGE_PCT
     if with_barniz_opaco:
         multiplier += BARNIZ_OPACO_SURCHARGE_PCT
+    multiplier += SHIPPING_SURCHARGE_PCT[shipping_method]
 
     total_cents = subtotal_cents * multiplier
     total_cents_int = int(total_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -253,6 +271,7 @@ def place_order(order: Order) -> Order:
                 with_tinta_blanca=order.with_tinta_blanca,
                 with_barniz_brillo=order.with_barniz_brillo,
                 with_barniz_opaco=order.with_barniz_opaco,
+                shipping_method=order.shipping_method,
             )
         else:
             order.total_amount_cents = _compute_catalog_total_cents(order)

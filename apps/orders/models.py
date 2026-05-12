@@ -63,6 +63,12 @@ KIND_CHOICES = [
     # at the customer's chosen physical size. Format: SVG (universal —
     # modern cutters + Illustrator + Inkscape all open it).
     ("cut_path", _("Cut path")),
+    # Customer-uploaded snapshot of the final editor view (artwork +
+    # cut polygon halo + material FX as they saw it client-side). Lets
+    # the shop owner see exactly what the customer designed without
+    # having to recompose the layers manually. PNG, written by the
+    # editor on Continuar via filesService.upload.
+    ("preview_composite", _("Preview composite")),
 ]
 
 # Cut shape — drives the die-cut path generation. `contorneado` follows the
@@ -74,6 +80,17 @@ SHAPE_CHOICES = [
     ("cuadrado", _("Cuadrado")),
     ("circulo", _("Círculo")),
     ("redondeadas", _("Esquinas redondeadas")),
+]
+
+# Shipping method — drives a multiplicative surcharge on the order total
+# (additive % stacking with the existing add-ons; see compute_total_cents).
+# Normal is the default and adds nothing; express adds 20%; flash adds 60%.
+# The three are mutually exclusive by enum (only one shipping_method per
+# order).
+SHIPPING_METHOD_CHOICES = [
+    ("normal", _("Envío normal (7-10 días)")),
+    ("express", _("Envío express (2-3 días)")),
+    ("flash", _("Envío flash (1 día)")),
 ]
 
 # Order kinds — discriminator between custom-sticker orders and catalog
@@ -173,6 +190,15 @@ class Order(BaseModel):
     city = models.CharField(_("city"), max_length=120, blank=True, default="")
     postal_code = models.CharField(_("postal code"), max_length=20, blank=True, default="")
     country = models.CharField(_("country"), max_length=2, blank=True, default="")
+    # Shipping speed — multiplicative surcharge on the total. Mutually
+    # exclusive enum (vs three booleans) because only one method applies
+    # per order.
+    shipping_method = models.CharField(
+        _("shipping method"),
+        max_length=10,
+        choices=SHIPPING_METHOD_CHOICES,
+        default="normal",
+    )
 
     # Money — store in cents to avoid float math; Stripe wants cents anyway
     total_amount_cents = models.PositiveIntegerField(_("total (cents)"), default=0)

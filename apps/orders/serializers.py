@@ -20,6 +20,7 @@ from .models import (
     MIN_QUANTITY,
     Order,
     OrderFile,
+    SHIPPING_METHOD_CHOICES,
 )
 
 
@@ -88,6 +89,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "city",
             "postal_code",
             "country",
+            "shipping_method",
             # Customer
             "customer_email",
             "customer_name",
@@ -179,6 +181,7 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "city",
             "postal_code",
             "country",
+            "shipping_method",
         ]
         extra_kwargs = {
             "kind": {"required": False},
@@ -189,6 +192,7 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "quantity": {"required": False},
             "product": {"required": False, "allow_null": True},
             "product_quantity": {"required": False},
+            "shipping_method": {"required": False},
         }
 
     def validate(self, attrs):
@@ -258,6 +262,11 @@ class PriceQuoteSerializer(serializers.Serializer):
     with_tinta_blanca = serializers.BooleanField(required=False, default=False)
     with_barniz_brillo = serializers.BooleanField(required=False, default=False)
     with_barniz_opaco = serializers.BooleanField(required=False, default=False)
+    shipping_method = serializers.ChoiceField(
+        choices=[c[0] for c in SHIPPING_METHOD_CHOICES],
+        required=False,
+        default="normal",
+    )
 
     def validate_width_mm(self, value):
         if value % DIMENSION_STEP_MM != 0:
