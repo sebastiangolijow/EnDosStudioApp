@@ -310,6 +310,69 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(order).data)
 
+    @action(detail=True, methods=["post"], url_path="admin-set-status")
+    def admin_set_status(self, request, pk=None):
+        """Staff-only manual status override.
+
+        Bypasses the usual transition guards so the shop owner can correct
+        mistakes (re-open a cancelled order, mark delivered retroactively,
+        etc.). Side effects:
+          - Stamps the matching *_at timestamp.
+          - When new_status='shipped' and the carrier/tracking fields are
+            provided, persists them and sends the customer a notification
+            email with the carrier + tracking + ETA.
+
+        Body:
+          status: one of the OrderStatus values (required)
+          shipping_carrier: free text, optional (used when status=shipped)
+          shipping_tracking_code: free text, optional
+          shipping_eta_date: ISO date (YYYY-MM-DD), optional
+        """
+        if not _is_staff(request.user):
+            raise PermissionDenied("Staff only.")
+        order = self.get_object()
+        new_status = request.data.get("status")
+        valid_statuses = {s for s, _label in Order._meta.get_field("status").choices}
+        if new_status not in valid_statuses:
+            return Response(
+                {"detail": f"Invalid status: {new_status!r}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from apps.orders.services import admin_set_order_status
+
+        order = admin_set_order_status(
+            order,
+            new_status=new_status,
+            actor=request.user,
+            shipping_carrier=request.data.get("shipping_carrier", "") or "",
+            shipping_tracking_code=request.data.get("shipping_tracking_code", "") or "",
+            shipping_eta_date=request.data.get("shipping_eta_date") or None,
+        )
+        return Response(OrderSerializer(order).data)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="shipping-carriers",
+        permission_classes=[],  # staff-gated below
+    )
+    def shipping_carriers(self, request):
+        """Distinct shipping_carrier values across all orders.
+
+        Powers the admin form's <datalist> autosuggest. Staff-only — exposes
+        operational info the public doesn't need.
+        """
+        if not _is_staff(request.user):
+            raise PermissionDenied("Staff only.")
+        carriers = (
+            Order.objects.exclude(shipping_carrier="")
+            .values_list("shipping_carrier", flat=True)
+            .distinct()
+            .order_by("shipping_carrier")
+        )
+        return Response({"results": list(carriers)})
+
     @action(detail=True, methods=["post"], url_path="smart-cut")
     def smart_cut(self, request, pk=None):
         """Run AI background removal on the order's `original` image.

@@ -34,6 +34,7 @@ allowed) and at least 25 mm (2.5 cm). Quantity must be in [20, 100000].
 """
 from decimal import ROUND_HALF_UP, Decimal
 
+from django.core.mail import send_mail
 from django.db import transaction
 from django.utils import timezone
 
@@ -459,3 +460,132 @@ def cancel_order(order: Order, *, actor, reason: str = "") -> Order:
         order._history_user = actor
         order.save(update_fields=["status", "cancelled_at", "updated_at"])
         return order
+
+
+_STATUS_TIMESTAMP_FIELD = {
+    "placed": "placed_at",
+    "paid": "paid_at",
+    "shipped": "shipped_at",
+    "delivered": "delivered_at",
+    "cancelled": "cancelled_at",
+}
+
+
+def admin_set_order_status(
+    order: Order,
+    *,
+    new_status: str,
+    actor,
+    shipping_carrier: str = "",
+    shipping_tracking_code: str = "",
+    shipping_eta_date: str | None = None,
+) -> Order:
+    """Manual status override for staff. Bypasses transition guards.
+
+    Side effects:
+      - Sets the matching *_at timestamp if not already populated and
+        the status implies one. Doesn't clear timestamps when status
+        moves backwards (so a re-opened order still records the prior
+        shipped_at — useful audit trail).
+      - When new_status == 'shipped' and carrier + tracking are provided,
+        persists them on the order and sends the customer a notification
+        email via _send_shipping_notification.
+
+    Doesn't recompute totals, file uploads, stock, or anything else — the
+    caller is the shop owner, who's expected to know what they're doing.
+    """
+    _require_staff(actor)
+    from datetime import date as _date
+
+    parsed_eta: _date | None = None
+    if shipping_eta_date:
+        if isinstance(shipping_eta_date, _date):
+            parsed_eta = shipping_eta_date
+        else:
+            # Accept "YYYY-MM-DD" (HTML date input format).
+            parsed_eta = _date.fromisoformat(str(shipping_eta_date))
+
+    with transaction.atomic():
+        order = _lock(order)
+        order.status = new_status
+        ts_field = _STATUS_TIMESTAMP_FIELD.get(new_status)
+        update_fields = ["status", "updated_at"]
+        if ts_field and getattr(order, ts_field) is None:
+            setattr(order, ts_field, timezone.now())
+            update_fields.append(ts_field)
+
+        notify = False
+        if new_status == "shipped":
+            if shipping_carrier:
+                order.shipping_carrier = shipping_carrier
+                update_fields.append("shipping_carrier")
+            if shipping_tracking_code:
+                order.shipping_tracking_code = shipping_tracking_code
+                update_fields.append("shipping_tracking_code")
+            if parsed_eta is not None:
+                order.shipping_eta_date = parsed_eta
+                update_fields.append("shipping_eta_date")
+            # Email is worth sending only if the customer has something
+            # to act on — at least a tracking code.
+            notify = bool(order.shipping_tracking_code)
+
+        order._history_user = actor
+        order.save(update_fields=update_fields)
+
+        if notify:
+            _send_shipping_notification(order)
+        return order
+
+
+def _send_shipping_notification(order: Order) -> None:
+    """Plain-text email to the customer with carrier + tracking + ETA.
+
+    Synchronous send; uses Django's default email backend. Failures are
+    logged but never bubble up — losing an email shouldn't block the
+    shop owner from marking the order shipped.
+    """
+    from django.conf import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    recipient = order.shipping_email or (
+        order.created_by.email if order.created_by_id else ""
+    )
+    if not recipient:
+        logger.warning(
+            "Shipping notification skipped for order %s — no recipient email.",
+            order.uuid,
+        )
+        return
+
+    short_uuid = str(order.uuid)[:8]
+    eta_line = ""
+    if order.shipping_eta_date:
+        eta_line = (
+            f"Fecha estimada de entrega: {order.shipping_eta_date.isoformat()}\n"
+        )
+
+    body = (
+        f"¡Hola!\n\n"
+        f"Tu pedido #{short_uuid} ya está en camino.\n\n"
+        f"Transportista: {order.shipping_carrier or '—'}\n"
+        f"Código de seguimiento: {order.shipping_tracking_code or '—'}\n"
+        f"{eta_line}"
+        f"\nGracias por confiar en nuestro taller.\n"
+    )
+
+    try:
+        send_mail(
+            subject=f"Tu pedido #{short_uuid} está en camino",
+            message=body,
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@stickerapp.local"),
+            recipient_list=[recipient],
+            fail_silently=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — third-party / SMTP errors
+        logger.warning(
+            "Shipping notification email failed for order %s: %s",
+            order.uuid,
+            exc,
+        )

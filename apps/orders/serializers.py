@@ -122,6 +122,9 @@ class OrderSerializer(serializers.ModelSerializer):
             "shipping_phone",
             "shipping_email",
             "shipping_method",
+            "shipping_carrier",
+            "shipping_tracking_code",
+            "shipping_eta_date",
             # Customer
             "customer_email",
             "customer_name",

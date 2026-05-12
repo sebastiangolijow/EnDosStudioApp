@@ -210,6 +210,21 @@ class Order(BaseModel):
         default="normal",
     )
 
+    # Filled by the admin from the "Marcar enviado" popup. All optional
+    # because the order may never reach the shipped state (cancelled
+    # orders, in-store pickup). Carrier is free text so the shop can use
+    # any local courier; the admin form autosuggests previously-used
+    # values via a dedicated /shipping-carriers/ endpoint.
+    shipping_carrier = models.CharField(
+        _("shipping carrier"), max_length=80, blank=True, default=""
+    )
+    shipping_tracking_code = models.CharField(
+        _("shipping tracking code"), max_length=120, blank=True, default=""
+    )
+    shipping_eta_date = models.DateField(
+        _("shipping ETA date"), null=True, blank=True
+    )
+
     # Money — store in cents to avoid float math; Stripe wants cents anyway
     total_amount_cents = models.PositiveIntegerField(_("total (cents)"), default=0)
     currency = models.CharField(_("currency"), max_length=3, default="EUR")
