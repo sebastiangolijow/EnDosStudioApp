@@ -81,6 +81,27 @@ class CatalogPlaceOrderTests(BaseTestCase):
             place_order(order)
         self.assertIn("insufficient_stock", str(ctx.exception))
 
+    def test_place_order_uses_sale_price_when_set(self):
+        """When sale_price_cents is set, pricing uses it instead of price_cents."""
+        product = Product.objects.create(
+            name="Llavero Oferta",
+            price_cents=2000,
+            sale_price_cents=1200,
+            stock_quantity=10,
+        )
+        customer = self.create_customer()
+        order = _fill_catalog_draft(
+            Order.objects.create(kind=KIND_CATALOG, created_by=customer),
+            product,
+            qty=2,
+        )
+
+        order = place_order(order)
+
+        # pre-IVA: 1200 × 2 = 2400 cents (NOT 2000 × 2 = 4000)
+        # all-in: 2400 × 1.21 = 2904 cents
+        self.assertEqual(order.total_amount_cents, 2904)
+
     def test_place_order_inactive_product_blocks(self):
         product = Product.objects.create(
             name="Oculto",

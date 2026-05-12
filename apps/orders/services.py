@@ -263,14 +263,15 @@ def _validate_catalog_required(order: Order) -> list[str]:
 
 
 def _compute_catalog_total_cents(order: Order) -> int:
-    """price_cents × product_quantity, plus 21% IVA on top.
+    """effective_price_cents × product_quantity, plus 21% IVA on top.
 
-    Mirrors the sticker pricing decision: Product.price_cents in the
-    admin is interpreted as the pre-IVA "base imponible" rate, and
-    Spanish B2C convention adds 21% to the customer-facing total. UI
-    breaks out the IVA portion via subtotal_cents_of / iva_cents_of.
+    Uses Product.effective_price_cents so a non-null sale_price_cents
+    supersedes the regular price_cents. Spanish B2C convention adds 21%
+    to the customer-facing total; UI breaks out the IVA portion via
+    subtotal_cents_of / iva_cents_of.
     """
-    pre_iva = Decimal(order.product.price_cents * order.product_quantity)
+    unit_pre_iva = order.product.effective_price_cents
+    pre_iva = Decimal(unit_pre_iva * order.product_quantity)
     total = pre_iva * (Decimal("1") + IVA_RATE)
     return int(total.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 

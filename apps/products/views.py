@@ -16,8 +16,8 @@ from rest_framework.response import Response
 
 from apps.core.permissions import IsAdminOrShopStaff
 
-from .models import Product
-from .serializers import ProductSerializer, ProductWriteSerializer
+from .models import Category, Product
+from .serializers import CategorySerializer, ProductSerializer, ProductWriteSerializer
 
 
 STAFF_ROLES = {"admin", "shop_staff"}
@@ -98,3 +98,16 @@ class ProductViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+
+class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """Public read-only category list — drives the admin form's autosuggest.
+
+    Categories are created implicitly when an admin types a new name on
+    ProductWriteSerializer. No explicit create/update endpoint; staff edit
+    the canonical name via Django admin if they ever need to.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = CategorySerializer
+    queryset = Category.objects.all()

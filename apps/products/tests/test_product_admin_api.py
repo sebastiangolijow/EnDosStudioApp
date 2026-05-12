@@ -121,6 +121,54 @@ class ProductStaffCRUDTests(BaseTestCase):
         self.assertEqual(product.slug, "sin-foto")
         self.assertFalse(product.image)
 
+    def test_admin_create_with_sale_price_weight_and_category(self):
+        """Three new optional fields land in the DB; category is implicitly
+        created from the free-text name."""
+        client, _ = self.authenticate_as_admin()
+        response = client.post(
+            reverse("product-list"),
+            data={
+                "name": "Llavero Oferta",
+                "price_cents": 2000,
+                "sale_price_cents": 1200,
+                "stock_quantity": 5,
+                "weight_grams": 40,
+                "category": "Llaveros",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        product = Product.objects.get(name="Llavero Oferta")
+        self.assertEqual(product.sale_price_cents, 1200)
+        self.assertEqual(product.weight_grams, 40)
+        self.assertIsNotNone(product.category)
+        self.assertEqual(product.category.name, "Llaveros")
+        self.assertEqual(product.category.slug, "llaveros")
+        # Read shape includes the new fields + computed effective_price.
+        self.assertEqual(response.data["sale_price_cents"], 1200)
+        self.assertEqual(response.data["sale_price_eur"], "12.00")
+        self.assertEqual(response.data["effective_price_cents"], 1200)
+        self.assertEqual(response.data["effective_price_eur"], "12.00")
+        self.assertEqual(response.data["weight_grams"], 40)
+        self.assertEqual(response.data["category"]["name"], "Llaveros")
+
+    def test_category_deduplicates_by_slug_across_products(self):
+        """Two products typed with the same category name reuse one Category row."""
+        from apps.products.models import Category
+
+        client, _ = self.authenticate_as_admin()
+        client.post(
+            reverse("product-list"),
+            data={"name": "Llavero A", "price_cents": 1000, "category": "Llaveros"},
+            format="json",
+        )
+        client.post(
+            reverse("product-list"),
+            data={"name": "Llavero B", "price_cents": 1100, "category": "llaveros "},
+            format="json",
+        )
+        self.assertEqual(Category.objects.filter(slug="llaveros").count(), 1)
+
     def test_staff_patches_stock_quantity(self):
         product = Product.objects.create(name="Llavero", price_cents=1500, stock_quantity=10)
         client, _ = self.authenticate_as_shop_staff()
