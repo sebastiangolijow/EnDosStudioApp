@@ -50,6 +50,7 @@ from .serializers import (
 from .services import (
     InvalidPricingInput,
     InvalidTransition,
+    apply_discount_to_order,
     cancel_order,
     compute_total_cents,
     mark_delivered,
@@ -214,6 +215,36 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         except (InvalidPricingInput, ValueError) as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="apply-discount")
+    def apply_discount(self, request, pk=None):
+        """Customer applies a promo code to their draft order.
+
+        Body: {code: string}. The service uppercases + looks up the
+        code, validates is_enabled, then re-runs the pricing pipeline
+        with the percent baked in. Returns the refreshed order so the
+        frontend can re-render the OrderSummary in one round-trip.
+
+        Errors:
+          - 404 'not_found' — no Discount row matches the code
+          - 409 'disabled'  — code exists but is_enabled=False
+          - 409 'wrong_status' — order is no longer a draft
+        """
+        order = self.get_object()
+        code = request.data.get("code", "")
+        try:
+            order = apply_discount_to_order(order, code=code, actor=request.user)
+        except InvalidPricingInput as e:
+            # 'not_found' is the only InvalidPricingInput this raises.
+            if str(e) == "not_found":
+                return Response(
+                    {"detail": "not_found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except InvalidTransition as e:
+            return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])

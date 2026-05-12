@@ -123,6 +123,7 @@ def compute_total_cents(
     with_barniz_brillo: bool = False,
     with_barniz_opaco: bool = False,
     shipping_method: str = "normal",
+    discount_percent: int = 0,
 ) -> int:
     """Pure pricing function. Decimal-based math, integer cents at the boundary.
 
@@ -133,6 +134,46 @@ def compute_total_cents(
     add-on surcharges: normal +0%, express +20%, flash +60%. Default
     'normal' so existing callers that don't pass it are unchanged.
     Unknown methods raise InvalidPricingInput.
+
+    discount_percent (0-100, default 0): a promo-code discount applied
+    AFTER the €20 floor and BEFORE the 21% IVA. The shop owner manages
+    codes via apps.discounts.models.Discount; OrderViewSet.apply_discount
+    stamps the percent onto the order at apply time and re-validates
+    at place / checkout / reserve. The floor exists because the print
+    shop has to cover materials + setup regardless; a discount on a
+    €20-floor order still pays €20 × (1 - pct/100), plus IVA on that.
+    """
+    return _compute_breakdown(
+        material=material,
+        width_mm=width_mm,
+        height_mm=height_mm,
+        quantity=quantity,
+        with_relief=with_relief,
+        with_tinta_blanca=with_tinta_blanca,
+        with_barniz_brillo=with_barniz_brillo,
+        with_barniz_opaco=with_barniz_opaco,
+        shipping_method=shipping_method,
+        discount_percent=discount_percent,
+    )["total_with_iva_cents"]
+
+
+def _compute_breakdown(
+    *,
+    material: str,
+    width_mm: int,
+    height_mm: int,
+    quantity: int,
+    with_relief: bool = False,
+    with_tinta_blanca: bool = False,
+    with_barniz_brillo: bool = False,
+    with_barniz_opaco: bool = False,
+    shipping_method: str = "normal",
+    discount_percent: int = 0,
+) -> dict:
+    """Internal: returns the breakdown components so callers that need
+    discount_cents alongside the all-in total don't have to compute
+    twice. Always returns integer cents. Public callers should use
+    compute_total_cents (just returns the all-in number).
     """
     if material not in MATERIAL_PRICE_CENTS:
         raise InvalidPricingInput(f"Unknown material: {material!r}")
@@ -152,6 +193,10 @@ def compute_total_cents(
         )
     if shipping_method not in SHIPPING_SURCHARGE_PCT:
         raise InvalidPricingInput(f"Unknown shipping_method: {shipping_method!r}")
+    if not (0 <= discount_percent <= 100):
+        raise InvalidPricingInput(
+            f"discount_percent={discount_percent} outside [0, 100]"
+        )
 
     # Area in m² including the 15 mm bleed margin on each side.
     bleed = Decimal(BLEED_MARGIN_MM)
@@ -172,18 +217,35 @@ def compute_total_cents(
         multiplier += BARNIZ_OPACO_SURCHARGE_PCT
     multiplier += SHIPPING_SURCHARGE_PCT[shipping_method]
 
-    # Pre-IVA subtotal: work × addon multipliers, floored at the
-    # minimum-order value (the floor is on the WORK, not on the all-in
-    # price — a small order pays €20 of work + IVA on top).
-    pre_iva_cents = subtotal_cents * multiplier
-    pre_iva_int = int(pre_iva_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    pre_iva_int = max(pre_iva_int, MIN_TOTAL_CENTS)
+    # Pre-discount, pre-IVA subtotal: work × addon multipliers, floored
+    # at the minimum-order value (the floor is on the WORK, not on the
+    # all-in price — a small order pays €20 of work + IVA on top).
+    pre_discount_cents = subtotal_cents * multiplier
+    pre_discount_int = int(
+        pre_discount_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    pre_discount_int = max(pre_discount_int, MIN_TOTAL_CENTS)
 
-    # IVA applied on top of the floored subtotal — customer total is
+    # Discount applied AFTER the floor, BEFORE IVA. So a 50% discount
+    # on a €20-floor order pays €10 + 21% IVA = €12.10 customer-facing.
+    discount_cents = int(
+        (Decimal(pre_discount_int) * Decimal(discount_percent) / Decimal(100))
+        .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    pre_iva_int = pre_discount_int - discount_cents
+
+    # IVA applied on top of the discounted pre-IVA — customer total is
     # all-in (Spanish B2C convention). UI breaks out the IVA portion
     # via subtotal_cents_of() / iva_cents_of() helpers below.
     total_with_iva = Decimal(pre_iva_int) * (Decimal("1") + IVA_RATE)
-    return int(total_with_iva.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    total_int = int(total_with_iva.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+    return {
+        "pre_discount_cents": pre_discount_int,
+        "discount_cents": discount_cents,
+        "pre_iva_cents": pre_iva_int,
+        "total_with_iva_cents": total_int,
+    }
 
 
 def subtotal_cents_of(total_cents: int) -> int:
@@ -264,17 +326,145 @@ def _validate_catalog_required(order: Order) -> list[str]:
 
 
 def _compute_catalog_total_cents(order: Order) -> int:
-    """effective_price_cents × product_quantity, plus 21% IVA on top.
+    """effective_price_cents × product_quantity, minus discount, plus 21% IVA.
 
     Uses Product.effective_price_cents so a non-null sale_price_cents
-    supersedes the regular price_cents. Spanish B2C convention adds 21%
-    to the customer-facing total; UI breaks out the IVA portion via
-    subtotal_cents_of / iva_cents_of.
+    supersedes the regular price_cents. Discount (if any) is applied
+    BEFORE IVA, matching the sticker pricing model — promo codes
+    discount the work, then IVA rides on top of the discounted amount.
+
+    Spanish B2C convention adds 21% IVA to the customer-facing total;
+    UI breaks out the IVA portion via subtotal_cents_of / iva_cents_of.
     """
     unit_pre_iva = order.product.effective_price_cents
-    pre_iva = Decimal(unit_pre_iva * order.product_quantity)
+    pre_discount = Decimal(unit_pre_iva * order.product_quantity)
+    # Catalog has no €20 floor (each product has its own price; small
+    # items like a €3 keychain shouldn't be inflated to €20 just to
+    # match the sticker floor). Discount applies straight to the
+    # pre-discount work amount.
+    discount_pct = _discount_percent_for_order(order)
+    discount = (pre_discount * Decimal(discount_pct) / Decimal(100)).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    )
+    pre_iva = pre_discount - discount
     total = pre_iva * (Decimal("1") + IVA_RATE)
     return int(total.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def apply_discount_to_order(order: Order, *, code: str, actor) -> Order:
+    """Customer applies a promo code to their draft order.
+
+    Looks up the code (case-insensitive, normalized to upper inside
+    Discount.save). Raises InvalidTransition / InvalidPricingInput on
+    failure modes the view translates to specific HTTP codes:
+
+      - InvalidPricingInput('not_found') → 404 (no such code)
+      - InvalidTransition('disabled')     → 409 (code exists but off)
+      - InvalidTransition('wrong_status') → 409 (order isn't a draft)
+
+    On success: stamps order.discount_code (uppercase) +
+    order.discount_cents, recomputes total_amount_cents, saves, and
+    returns the refreshed order. The recompute uses the same
+    _recompute_order_total path the place / reserve transitions use,
+    so the customer-facing total reflects the discount immediately.
+    """
+    from apps.discounts.models import Discount
+
+    _require_owner(order, actor)
+    normalized = (code or "").strip().upper()
+    if not normalized:
+        raise InvalidPricingInput("not_found")
+    try:
+        discount = Discount.objects.get(code=normalized)
+    except Discount.DoesNotExist:
+        raise InvalidPricingInput("not_found")
+    if not discount.is_enabled:
+        raise InvalidTransition("disabled")
+
+    with transaction.atomic():
+        order = _lock(order)
+        # Only drafts can have their discount changed. Once the order
+        # is placed/paid/etc., the discount is part of the snapshot.
+        if order.status != "draft":
+            raise InvalidTransition("wrong_status")
+
+        order.discount_code = normalized
+        _recompute_order_total(order)
+        order._history_user = actor
+        order.save(
+            update_fields=[
+                "discount_code",
+                "discount_cents",
+                "total_amount_cents",
+                "updated_at",
+            ]
+        )
+        return order
+
+
+def _recompute_order_total(order: Order) -> None:
+    """Compute order.total_amount_cents and order.discount_cents from
+    the current spec + discount_code state. Mutates the order in
+    place; caller is responsible for saving.
+
+    Single source of truth for the pricing math so place_order,
+    reserve_order, and apply_discount all produce identical numbers.
+    Skips empty/insufficient state (e.g. before the customer has
+    picked a material) — those paths run their own fill-validation
+    first.
+    """
+    discount_pct = _discount_percent_for_order(order)
+    if order.kind == KIND_STICKER:
+        breakdown = _compute_breakdown(
+            material=order.material,
+            width_mm=order.width_mm,
+            height_mm=order.height_mm,
+            quantity=order.quantity,
+            with_relief=order.with_relief,
+            with_tinta_blanca=order.with_tinta_blanca,
+            with_barniz_brillo=order.with_barniz_brillo,
+            with_barniz_opaco=order.with_barniz_opaco,
+            shipping_method=order.shipping_method,
+            discount_percent=discount_pct,
+        )
+        order.total_amount_cents = breakdown["total_with_iva_cents"]
+        order.discount_cents = breakdown["discount_cents"]
+    else:
+        # Catalog: discount applies to product price × qty, before IVA.
+        # _compute_catalog_total_cents reads the order's discount_code
+        # to derive the percent, then folds discount + IVA in.
+        unit_pre_iva = order.product.effective_price_cents
+        pre_discount = Decimal(unit_pre_iva * order.product_quantity)
+        discount = (
+            pre_discount * Decimal(discount_pct) / Decimal(100)
+        ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        order.discount_cents = int(discount)
+        order.total_amount_cents = _compute_catalog_total_cents(order)
+
+
+def _discount_percent_for_order(order: Order) -> int:
+    """Resolve the live discount percent for this order from its
+    persisted discount_code. Returns 0 when there's no code OR when
+    the code has been disabled / deleted since it was applied.
+
+    Stored discount_cents is the snapshot from the apply moment, but
+    we re-derive the percent here so the recomputed total can't drift
+    if the admin disables the code between apply and place/checkout.
+    """
+    if not order.discount_code:
+        return 0
+    # Late import — apps.discounts imports apps.orders for the order
+    # views' apply-discount action, so we'd hit a circular at module
+    # load if we imported eagerly.
+    from apps.discounts.models import Discount
+
+    try:
+        d = Discount.objects.get(code=order.discount_code)
+    except Discount.DoesNotExist:
+        return 0
+    if not d.is_enabled:
+        return 0
+    return int(d.percent_off)
 
 
 def place_order(order: Order) -> Order:
@@ -313,24 +503,26 @@ def place_order(order: Order) -> Order:
         if missing:
             raise InvalidTransition(f"Cannot place order; missing: {', '.join(missing)}.")
 
-        if order.kind == KIND_STICKER:
-            order.total_amount_cents = compute_total_cents(
-                material=order.material,
-                width_mm=order.width_mm,
-                height_mm=order.height_mm,
-                quantity=order.quantity,
-                with_relief=order.with_relief,
-                with_tinta_blanca=order.with_tinta_blanca,
-                with_barniz_brillo=order.with_barniz_brillo,
-                with_barniz_opaco=order.with_barniz_opaco,
-                shipping_method=order.shipping_method,
-            )
-        else:
-            order.total_amount_cents = _compute_catalog_total_cents(order)
+        # Recompute total + discount_cents from scratch — picks up any
+        # discount_code applied earlier via the /apply-discount/ endpoint.
+        # If the admin disabled the code between apply and place, this
+        # path produces a 0% discount silently (matches what the customer
+        # would have seen if they'd re-validated; place_order doesn't
+        # raise — they explicitly chose to checkout, the system shouldn't
+        # block on an admin action).
+        _recompute_order_total(order)
 
         order.status = "placed"
         order.placed_at = timezone.now()
-        order.save(update_fields=["status", "placed_at", "total_amount_cents", "updated_at"])
+        order.save(
+            update_fields=[
+                "status",
+                "placed_at",
+                "total_amount_cents",
+                "discount_cents",
+                "updated_at",
+            ]
+        )
         return order
 
 
@@ -396,20 +588,10 @@ def reserve_order(order: Order, *, actor, pickup_at) -> Order:
             )
 
         # Compute the total now too — owner takes cash for this amount.
-        if order.kind == KIND_STICKER:
-            order.total_amount_cents = compute_total_cents(
-                material=order.material,
-                width_mm=order.width_mm,
-                height_mm=order.height_mm,
-                quantity=order.quantity,
-                with_relief=order.with_relief,
-                with_tinta_blanca=order.with_tinta_blanca,
-                with_barniz_brillo=order.with_barniz_brillo,
-                with_barniz_opaco=order.with_barniz_opaco,
-                shipping_method=order.shipping_method,
-            )
-        else:
-            order.total_amount_cents = _compute_catalog_total_cents(order)
+        # Picks up any discount the customer applied earlier; same
+        # silent-fallback-to-0% behavior as place_order if the code
+        # was disabled between apply and reserve.
+        _recompute_order_total(order)
 
         order.status = "reserved"
         order.pickup_at = parsed
@@ -425,6 +607,7 @@ def reserve_order(order: Order, *, actor, pickup_at) -> Order:
                 "reserved_at",
                 "placed_at",
                 "total_amount_cents",
+                "discount_cents",
                 "updated_at",
             ]
         )

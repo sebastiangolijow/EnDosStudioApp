@@ -81,6 +81,7 @@ class OrderSerializer(serializers.ModelSerializer):
     iva_cents = serializers.SerializerMethodField()
     subtotal_eur = serializers.SerializerMethodField()
     iva_eur = serializers.SerializerMethodField()
+    discount_eur = serializers.SerializerMethodField()
     product_detail = ProductRefSerializer(source="product", read_only=True)
     # Customer contact info — exposed so the admin orders screen can
     # show "Pedido #abc · Sebastián Golijow · seba@example.com" at a
@@ -137,6 +138,13 @@ class OrderSerializer(serializers.ModelSerializer):
             "subtotal_eur",
             "iva_cents",
             "iva_eur",
+            # Promo code applied to this order. discount_code is the
+            # uppercase text (audit trail); discount_cents is the
+            # integer cents subtracted from the pre-IVA work amount.
+            # discount_eur is the same value formatted for display.
+            "discount_code",
+            "discount_cents",
+            "discount_eur",
             "currency",
             "stripe_payment_intent_id",
             # Files
@@ -165,6 +173,9 @@ class OrderSerializer(serializers.ModelSerializer):
             "subtotal_eur",
             "iva_cents",
             "iva_eur",
+            "discount_code",
+            "discount_cents",
+            "discount_eur",
             "currency",
             "stripe_payment_intent_id",
             "files",
@@ -182,8 +193,15 @@ class OrderSerializer(serializers.ModelSerializer):
         return f"{obj.total_amount_cents / 100:.2f}"
 
     def get_subtotal_cents(self, obj) -> int:
+        """Pre-discount, pre-IVA subtotal — what the work would cost
+        without the promo code. The customer-facing summary card
+        reads as 'Subtotal − Descuento + IVA = Total', so this value
+        is the WORK price before any discount was subtracted.
+
+        Derived as (total / 1.21) + discount_cents so the four lines
+        round-trip exactly with total_amount_cents."""
         from .services import subtotal_cents_of
-        return subtotal_cents_of(obj.total_amount_cents)
+        return subtotal_cents_of(obj.total_amount_cents) + obj.discount_cents
 
     def get_iva_cents(self, obj) -> int:
         from .services import iva_cents_of
@@ -191,11 +209,14 @@ class OrderSerializer(serializers.ModelSerializer):
 
     def get_subtotal_eur(self, obj) -> str:
         from .services import subtotal_cents_of
-        return f"{subtotal_cents_of(obj.total_amount_cents) / 100:.2f}"
+        return f"{(subtotal_cents_of(obj.total_amount_cents) + obj.discount_cents) / 100:.2f}"
 
     def get_iva_eur(self, obj) -> str:
         from .services import iva_cents_of
         return f"{iva_cents_of(obj.total_amount_cents) / 100:.2f}"
+
+    def get_discount_eur(self, obj) -> str:
+        return f"{obj.discount_cents / 100:.2f}"
 
     def get_customer_email(self, obj) -> str:
         return obj.created_by.email if obj.created_by else ""

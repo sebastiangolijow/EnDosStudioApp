@@ -261,6 +261,20 @@ class Order(BaseModel):
     # so the owner knows when to expect them.
     pickup_at = models.DateTimeField(_("pickup at"), null=True, blank=True)
 
+    # Discount applied to this order. discount_code is the text the
+    # customer entered (stored uppercase, normalized when the
+    # apply-discount endpoint validates against the Discount table) —
+    # it's an audit trail that survives even if the matching Discount
+    # row is later deleted. discount_cents is the integer cents
+    # subtracted from the pre-IVA work subtotal; the IVA-included
+    # total_amount_cents already reflects the discount.
+    discount_code = models.CharField(
+        _("discount code"), max_length=40, blank=True, default=""
+    )
+    discount_cents = models.PositiveIntegerField(
+        _("discount (cents, pre-IVA)"), default=0
+    )
+
     history = HistoricalRecords(
         history_user_id_field=models.UUIDField(null=True, blank=True),
     )
