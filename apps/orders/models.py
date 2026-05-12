@@ -190,6 +190,16 @@ class Order(BaseModel):
     city = models.CharField(_("city"), max_length=120, blank=True, default="")
     postal_code = models.CharField(_("postal code"), max_length=20, blank=True, default="")
     country = models.CharField(_("country"), max_length=2, blank=True, default="")
+    # Per-shipment contact — required at place_order. Stored on the order
+    # (not just the User) because shipping a gift to grandma needs
+    # grandma's phone, not the customer's. Pre-fill in the frontend
+    # from the User's stored phone/email when available.
+    shipping_phone = models.CharField(
+        _("shipping phone"), max_length=50, blank=True, default=""
+    )
+    shipping_email = models.EmailField(
+        _("shipping email"), blank=True, default=""
+    )
     # Shipping speed — multiplicative surcharge on the total. Mutually
     # exclusive enum (vs three booleans) because only one method applies
     # per order.

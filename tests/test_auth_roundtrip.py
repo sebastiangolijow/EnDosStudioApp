@@ -45,6 +45,7 @@ class AuthRoundtripTests(BaseTestCase):
                 "password": initial_password,
                 "first_name": "New",
                 "last_name": "Customer",
+                "phone_number": "+34 600 123 456",
             },
             format="json",
         )
@@ -54,6 +55,7 @@ class AuthRoundtripTests(BaseTestCase):
         self.assertFalse(user.is_active, "registered user should be inactive until set-password")
         self.assertFalse(user.is_verified)
         self.assertTrue(user.verification_token, "register should generate a token")
+        self.assertEqual(user.phone_number, "+34 600 123 456")
         self.assertFalse(
             EmailAddress.objects.filter(user=user).exists(),
             "EmailAddress row must NOT exist yet — only set-password creates it",
@@ -139,7 +141,11 @@ class AuthRoundtripTests(BaseTestCase):
         client = APIClient()
         client.post(
             REGISTER_URL,
-            data={"email": "tok@example.com", "password": "x" * 12},
+            data={
+                "email": "tok@example.com",
+                "password": "x" * 12,
+                "phone_number": "+34 600 000 001",
+            },
             format="json",
         )
         r = client.post(
@@ -167,7 +173,11 @@ class AuthRoundtripTests(BaseTestCase):
         client = APIClient()
         r = client.post(
             REGISTER_URL,
-            data={"email": "existing@example.com", "password": "SomePass123!"},
+            data={
+                "email": "existing@example.com",
+                "password": "SomePass123!",
+                "phone_number": "+34 600 000 002",
+            },
             format="json",
         )
         # Per RegisterView: returns 200 with the same generic message even if
@@ -194,6 +204,30 @@ class AuthRoundtripTests(BaseTestCase):
         self.assertEqual(r.status_code, 200, r.data)
         self.assertTrue(r.data.get("access") or r.data.get("access_token"))
 
+    def test_register_requires_phone_number(self):
+        """Phone is required at the RegisterSerializer layer — without it
+        registration must return 400 and no user should be created. The
+        model-level column stays blank-allowed (existing legacy rows are
+        unaffected); only new signups must provide a phone."""
+        client = APIClient()
+        r = client.post(
+            REGISTER_URL,
+            data={
+                "email": "nophone@example.com",
+                "password": "PhonelessPass1!",
+                "first_name": "No",
+                "last_name": "Phone",
+                # phone_number deliberately omitted
+            },
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400, r.data)
+        self.assertIn("phone_number", r.data)
+        self.assertFalse(
+            User.objects.filter(email="nophone@example.com").exists(),
+            "no user should be created when phone_number is missing",
+        )
+
 
 class VerificationEmailServiceTests(BaseTestCase):
     """Edge cases for send_verification_email() that aren't easy to trigger
@@ -209,7 +243,11 @@ class VerificationEmailServiceTests(BaseTestCase):
         ):
             r = APIClient().post(
                 REGISTER_URL,
-                data={"email": "smtpdown@example.com", "password": "Pwd12345!"},
+                data={
+                    "email": "smtpdown@example.com",
+                    "password": "Pwd12345!",
+                    "phone_number": "+34 600 000 003",
+                },
                 format="json",
             )
         self.assertEqual(r.status_code, 200)

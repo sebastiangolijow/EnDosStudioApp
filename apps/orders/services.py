@@ -255,7 +255,14 @@ def place_order(order: Order) -> Order:
         else:
             raise InvalidTransition(f"Unknown order kind {order.kind!r}.")
 
-        for field in ("recipient_name", "street_line_1", "city", "postal_code", "country"):
+        for field in (
+            "recipient_name",
+            "street_line_1",
+            "city",
+            "postal_code",
+            "country",
+            "shipping_phone",
+        ):
             if not getattr(order, field):
                 missing.append(field)
         if missing:

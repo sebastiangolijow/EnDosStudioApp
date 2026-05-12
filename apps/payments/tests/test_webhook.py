@@ -60,6 +60,7 @@ class StripeWebhookTests(BaseTestCase):
         self.order.city = "Barcelona"
         self.order.postal_code = "08001"
         self.order.country = "ES"
+        self.order.shipping_phone = "+34 600 123 456"
         self.order.save()
         OrderFile.objects.create(
             order=self.order,

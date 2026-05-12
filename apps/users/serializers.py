@@ -32,12 +32,20 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class RegisterSerializer(serializers.Serializer):
-    """Customer self-registration. Always creates role=customer, is_active=False."""
+    """Customer self-registration. Always creates role=customer, is_active=False.
+
+    Phone number is required at the serializer layer (not the model
+    layer). Existing User rows in the DB may have blank phones — making
+    the column NOT NULL would require backfilling those, which we
+    haven't done. Serializer-level enforcement means new signups must
+    provide a phone while legacy accounts keep working unchanged.
+    """
 
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
     first_name = serializers.CharField(max_length=50, required=False, allow_blank=True)
     last_name = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=50)
 
 
 class SetPasswordSerializer(serializers.Serializer):

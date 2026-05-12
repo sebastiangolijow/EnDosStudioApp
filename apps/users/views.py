@@ -50,6 +50,7 @@ class RegisterView(APIView):
             password=serializer.validated_data["password"],
             first_name=serializer.validated_data.get("first_name", ""),
             last_name=serializer.validated_data.get("last_name", ""),
+            phone_number=serializer.validated_data["phone_number"],
             role="customer",
             is_active=False,
             is_verified=False,

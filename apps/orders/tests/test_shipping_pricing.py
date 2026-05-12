@@ -126,3 +126,71 @@ class ShippingMethodAPITests(BaseTestCase):
         self.assertEqual(res.status_code, 200)
         # 7142 cents == 71.42 €
         self.assertEqual(res.data["total_amount_cents"], 7142)
+
+
+class ShippingContactTests(BaseTestCase):
+    """shipping_phone + shipping_email on Order."""
+
+    def _make_draft_with_address(self, customer):
+        """Fully-populated draft EXCEPT shipping_phone — so place_order
+        can be tested against the new required-field rule."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from apps.orders.models import OrderFile
+
+        order = Order.objects.create(
+            created_by=customer,
+            status="draft",
+            material="vinilo_blanco",
+            width_mm=100,
+            height_mm=100,
+            quantity=100,
+            recipient_name="Test Recipient",
+            street_line_1="Carrer 1",
+            city="Barcelona",
+            postal_code="08001",
+            country="ES",
+        )
+        OrderFile.objects.create(
+            order=order,
+            kind="original",
+            file=SimpleUploadedFile("test.png", b"\x89PNG fake", content_type="image/png"),
+            created_by=customer,
+        )
+        return order
+
+    def test_shipping_phone_email_round_trip_via_patch(self):
+        client, customer = self.authenticate_as_customer()
+        order = self._make_draft_with_address(customer)
+        res = client.patch(
+            reverse("order-detail", kwargs={"pk": order.pk}),
+            data={
+                "shipping_phone": "+34 611 222 333",
+                "shipping_email": "alt@example.com",
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["shipping_phone"], "+34 611 222 333")
+        self.assertEqual(res.data["shipping_email"], "alt@example.com")
+        order.refresh_from_db()
+        self.assertEqual(order.shipping_phone, "+34 611 222 333")
+        self.assertEqual(order.shipping_email, "alt@example.com")
+
+    def test_place_order_requires_shipping_phone(self):
+        """place_order should 409 when shipping_phone is missing — same
+        guard as recipient_name/street/city/postal_code/country."""
+        client, customer = self.authenticate_as_customer()
+        order = self._make_draft_with_address(customer)
+        # No shipping_phone set.
+        res = client.post(reverse("order-place", kwargs={"pk": order.pk}))
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("shipping_phone", res.data.get("detail", ""))
+
+    def test_place_order_succeeds_with_shipping_phone(self):
+        client, customer = self.authenticate_as_customer()
+        order = self._make_draft_with_address(customer)
+        order.shipping_phone = "+34 600 999 888"
+        order.save(update_fields=["shipping_phone"])
+        res = client.post(reverse("order-place", kwargs={"pk": order.pk}))
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["status"], "placed")

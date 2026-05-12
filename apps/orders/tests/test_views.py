@@ -32,6 +32,7 @@ def _fill_draft(order, with_file=True, customer=None):
     order.city = "Barcelona"
     order.postal_code = "08001"
     order.country = "ES"
+    order.shipping_phone = "+34 600 123 456"  # required at place_order
     order.save()
     if with_file:
         OrderFile.objects.create(

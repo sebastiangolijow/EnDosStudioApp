@@ -30,6 +30,7 @@ def _fill_catalog_draft(order, product, qty=2):
     order.city = "Barcelona"
     order.postal_code = "08001"
     order.country = "ES"
+    order.shipping_phone = "+34 600 123 456"
     order.save()
     return order
 
@@ -59,6 +60,7 @@ class CatalogPlaceOrderTests(BaseTestCase):
         order.city = "Barcelona"
         order.postal_code = "08001"
         order.country = "ES"
+        order.shipping_phone = "+34 600 123 456"
         order.save()
 
         with self.assertRaises(InvalidTransition) as ctx:

@@ -89,6 +89,8 @@ class OrderSerializer(serializers.ModelSerializer):
             "city",
             "postal_code",
             "country",
+            "shipping_phone",
+            "shipping_email",
             "shipping_method",
             # Customer
             "customer_email",
@@ -181,6 +183,8 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "city",
             "postal_code",
             "country",
+            "shipping_phone",
+            "shipping_email",
             "shipping_method",
         ]
         extra_kwargs = {
@@ -192,6 +196,8 @@ class OrderUpdateSerializer(serializers.ModelSerializer):
             "quantity": {"required": False},
             "product": {"required": False, "allow_null": True},
             "product_quantity": {"required": False},
+            "shipping_phone": {"required": False},
+            "shipping_email": {"required": False},
             "shipping_method": {"required": False},
         }
 
