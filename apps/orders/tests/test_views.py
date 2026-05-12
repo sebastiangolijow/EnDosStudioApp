@@ -180,9 +180,13 @@ class OrderLifecycleTests(BaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["status"], "placed")
         # vinilo_blanco 10×10cm q=100 → ((100+15)/1000)² × 100 × 45€
-        # = 0.013225 × 4500 = 59.5125€ → ROUND_HALF_UP → 5951 cents
-        self.assertEqual(response.data["total_amount_cents"], 5951)
-        self.assertEqual(response.data["total_eur"], "59.51")
+        # = 0.013225 × 4500 = 59.5125€ → ROUND_HALF_UP → 5951 cents pre-IVA
+        # All-in: 5951 × 1.21 = 7200.71 → 7201 cents (72.01 €).
+        self.assertEqual(response.data["total_amount_cents"], 7201)
+        self.assertEqual(response.data["total_eur"], "72.01")
+        # IVA breakdown: 7201 / 1.21 = 5951.24… → 5951; IVA = 7201 − 5951 = 1250.
+        self.assertEqual(response.data["subtotal_cents"], 5951)
+        self.assertEqual(response.data["iva_cents"], 1250)
 
     def test_place_fails_409_if_missing_fields(self):
         client, customer = self.authenticate_as_customer()
@@ -277,12 +281,12 @@ class CheckoutTests(BaseTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["client_secret"], "pi_test_checkout_1_secret_xyz")
         self.assertEqual(response.data["payment_intent_id"], "pi_test_checkout_1")
-        self.assertEqual(response.data["amount_cents"], 5951)
+        self.assertEqual(response.data["amount_cents"], 7201)
         self.assertEqual(response.data["currency"], "EUR")
 
         # Stripe was called with the right amount + metadata
         _, kwargs = create_mock.call_args
-        self.assertEqual(kwargs["amount_cents"], 5951)
+        self.assertEqual(kwargs["amount_cents"], 7201)
         self.assertEqual(kwargs["currency"], "eur")
         self.assertEqual(kwargs["order_uuid"], str(order.pk))
 
@@ -312,7 +316,7 @@ class CheckoutTests(BaseTestCase):
 
 class PriceQuoteTests(BaseTestCase):
     def test_quote_gold_standard(self):
-        # vinilo_blanco 10×10cm q=100 → 59.51€ — comfortably above the floor
+        # vinilo_blanco 10×10cm q=100 — pre-IVA 5951 cents; +21% IVA → 7201
         client, _ = self.authenticate_as_customer()
         response = client.get(
             reverse("order-quote"),
@@ -324,13 +328,14 @@ class PriceQuoteTests(BaseTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_amount_cents"], 5951)
-        self.assertEqual(response.data["total_eur"], "59.51")
+        self.assertEqual(response.data["total_amount_cents"], 7201)
+        self.assertEqual(response.data["total_eur"], "72.01")
         self.assertEqual(response.data["currency"], "EUR")
 
     def test_quote_with_addons(self):
         # vinilo_blanco 10×10cm q=100 +relieve(+35%) +barniz_brillo(+20%)
-        # subtotal 5951.25 cents × 1.55 = 9224.4375 → 9224 cents
+        # pre-IVA: 5951.25 × 1.55 = 9224.4375 → 9224
+        # all-in:  9224 × 1.21 = 11161.04 → 11161
         client, _ = self.authenticate_as_customer()
         response = client.get(
             reverse("order-quote"),
@@ -344,10 +349,11 @@ class PriceQuoteTests(BaseTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_amount_cents"], 9224)
+        self.assertEqual(response.data["total_amount_cents"], 11161)
 
     def test_quote_floors_small_orders_to_20_eur(self):
-        # holografico 5×5cm q=50: subtotal ~10.56€ → floor kicks in
+        # holografico 5×5cm q=50: subtotal ~10.56€ → floor (20€ pre-IVA)
+        # kicks in. All-in: 2000 × 1.21 = 2420 cents (24.20 €).
         client, _ = self.authenticate_as_customer()
         response = client.get(
             reverse("order-quote"),
@@ -359,12 +365,12 @@ class PriceQuoteTests(BaseTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_amount_cents"], 2000)
-        self.assertEqual(response.data["total_eur"], "20.00")
+        self.assertEqual(response.data["total_amount_cents"], 2420)
+        self.assertEqual(response.data["total_eur"], "24.20")
 
     def test_quote_floor_applies_AFTER_addons(self):
-        # vinilo_blanco 5×5cm q=20 +relieve: subtotal 3.80€, ×1.35 = 5.13€,
-        # still well below 20€ → floor wins, not 5.13×anything.
+        # vinilo_blanco 5×5cm q=20 +relieve: subtotal 3.80€ × 1.35 = 5.13€,
+        # well below 20€ floor → floor wins (pre-IVA 2000), then +21% IVA.
         client, _ = self.authenticate_as_customer()
         response = client.get(
             reverse("order-quote"),
@@ -377,7 +383,7 @@ class PriceQuoteTests(BaseTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_amount_cents"], 2000)
+        self.assertEqual(response.data["total_amount_cents"], 2420)
 
     def test_quote_rejects_non_step_dimensions(self):
         client, _ = self.authenticate_as_customer()

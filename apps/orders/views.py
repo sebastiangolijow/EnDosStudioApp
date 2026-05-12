@@ -424,10 +424,20 @@ class PriceQuoteView(APIView):
             total_cents = compute_total_cents(**ser.validated_data)
         except InvalidPricingInput as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # IVA breakdown — same helpers OrderSerializer uses, so the
+        # numbers are identical to what the customer sees on the
+        # post-place_order summary card.
+        from .services import iva_cents_of, subtotal_cents_of
+        subtotal_cents = subtotal_cents_of(total_cents)
+        iva_cents = iva_cents_of(total_cents)
         return Response(
             {
                 "total_amount_cents": total_cents,
                 "total_eur": f"{total_cents / 100:.2f}",
+                "subtotal_cents": subtotal_cents,
+                "subtotal_eur": f"{subtotal_cents / 100:.2f}",
+                "iva_cents": iva_cents,
+                "iva_eur": f"{iva_cents / 100:.2f}",
                 "currency": "EUR",
             },
             status=status.HTTP_200_OK,

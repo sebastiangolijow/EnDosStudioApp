@@ -48,8 +48,9 @@ class CatalogPlaceOrderTests(BaseTestCase):
         order = place_order(order)
 
         self.assertEqual(order.status, "placed")
-        # 1500 cents × 3 = 4500 cents
-        self.assertEqual(order.total_amount_cents, 4500)
+        # pre-IVA: 1500 cents × 3 = 4500 cents
+        # all-in:  4500 × 1.21 = 5445 cents
+        self.assertEqual(order.total_amount_cents, 5445)
 
     def test_place_order_missing_product_blocks(self):
         customer = self.create_customer()
@@ -191,7 +192,8 @@ class CatalogCheckoutStockGuardTests(BaseTestCase):
             response = client.post(reverse("order-checkout", kwargs={"pk": order.pk}))
 
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["amount_cents"], 4500)  # 1500 × 3
+        # 1500 × 3 = 4500 pre-IVA; ×1.21 = 5445 all-in.
+        self.assertEqual(response.data["amount_cents"], 5445)
 
 
 class StickerRegressionTests(BaseTestCase):
@@ -212,9 +214,9 @@ class StickerRegressionTests(BaseTestCase):
 
         self.assertEqual(order.status, "placed")
         self.assertEqual(order.kind, KIND_STICKER)
-        # Default sticker order from _fill_draft is the new gold standard
-        # (vinilo_blanco 10×10cm q=100 → 5951 cents).
-        self.assertEqual(order.total_amount_cents, 5951)
+        # Default sticker order from _fill_draft is the gold standard
+        # (vinilo_blanco 10×10cm q=100 → 5951 cents pre-IVA, ×1.21 → 7201).
+        self.assertEqual(order.total_amount_cents, 7201)
 
     def test_sticker_transition_to_paid_still_calls_cut_path(self):
         from apps.orders.tests.test_views import _fill_draft

@@ -89,6 +89,13 @@ SHIPPING_SURCHARGE_PCT = {
     "flash": Decimal("0.60"),
 }
 
+# Spanish IVA (VAT). Applied AFTER the addon stack + the MIN_TOTAL floor,
+# so the floor is "minimum work value" (pre-IVA). Customer's displayed
+# total INCLUDES IVA — Real Decreto Legislativo 1/2007 art. 60 requires
+# B2C prices in Spain to be shown all-in. The summary card breaks out
+# the IVA portion separately for transparency / invoicing.
+IVA_RATE = Decimal("0.21")
+
 ADMIN_ROLES = {"admin", "shop_staff"}
 
 
@@ -164,9 +171,37 @@ def compute_total_cents(
         multiplier += BARNIZ_OPACO_SURCHARGE_PCT
     multiplier += SHIPPING_SURCHARGE_PCT[shipping_method]
 
-    total_cents = subtotal_cents * multiplier
-    total_cents_int = int(total_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    return max(total_cents_int, MIN_TOTAL_CENTS)
+    # Pre-IVA subtotal: work × addon multipliers, floored at the
+    # minimum-order value (the floor is on the WORK, not on the all-in
+    # price — a small order pays €20 of work + IVA on top).
+    pre_iva_cents = subtotal_cents * multiplier
+    pre_iva_int = int(pre_iva_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    pre_iva_int = max(pre_iva_int, MIN_TOTAL_CENTS)
+
+    # IVA applied on top of the floored subtotal — customer total is
+    # all-in (Spanish B2C convention). UI breaks out the IVA portion
+    # via subtotal_cents_of() / iva_cents_of() helpers below.
+    total_with_iva = Decimal(pre_iva_int) * (Decimal("1") + IVA_RATE)
+    return int(total_with_iva.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def subtotal_cents_of(total_cents: int) -> int:
+    """Reverse the IVA inclusion: total / (1 + IVA_RATE), rounded to cents.
+
+    Used by the OrderSerializer to expose the pre-IVA subtotal alongside
+    total_amount_cents — the customer-facing summary card breaks the
+    line out as "Subtotal + IVA = Total". Round-trips exactly with
+    compute_total_cents because both use ROUND_HALF_UP.
+    """
+    if total_cents <= 0:
+        return 0
+    sub = Decimal(total_cents) / (Decimal("1") + IVA_RATE)
+    return int(sub.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def iva_cents_of(total_cents: int) -> int:
+    """The IVA portion of an IVA-included total. Equal to total - subtotal."""
+    return total_cents - subtotal_cents_of(total_cents)
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +263,16 @@ def _validate_catalog_required(order: Order) -> list[str]:
 
 
 def _compute_catalog_total_cents(order: Order) -> int:
-    """price_cents × product_quantity. Read price from the linked Product."""
-    return order.product.price_cents * order.product_quantity
+    """price_cents × product_quantity, plus 21% IVA on top.
+
+    Mirrors the sticker pricing decision: Product.price_cents in the
+    admin is interpreted as the pre-IVA "base imponible" rate, and
+    Spanish B2C convention adds 21% to the customer-facing total. UI
+    breaks out the IVA portion via subtotal_cents_of / iva_cents_of.
+    """
+    pre_iva = Decimal(order.product.price_cents * order.product_quantity)
+    total = pre_iva * (Decimal("1") + IVA_RATE)
+    return int(total.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def place_order(order: Order) -> Order:

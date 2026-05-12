@@ -51,6 +51,13 @@ class ProductRefSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     files = OrderFileSerializer(many=True, read_only=True)
     total_eur = serializers.SerializerMethodField()
+    # IVA breakdown derived from the IVA-included total_amount_cents.
+    # Customer-facing summary card shows "Subtotal + IVA = Total" and
+    # the invoice needs the IVA portion itemized (Spanish law).
+    subtotal_cents = serializers.SerializerMethodField()
+    iva_cents = serializers.SerializerMethodField()
+    subtotal_eur = serializers.SerializerMethodField()
+    iva_eur = serializers.SerializerMethodField()
     product_detail = ProductRefSerializer(source="product", read_only=True)
     # Customer contact info — exposed so the admin orders screen can
     # show "Pedido #abc · Sebastián Golijow · seba@example.com" at a
@@ -95,9 +102,15 @@ class OrderSerializer(serializers.ModelSerializer):
             # Customer
             "customer_email",
             "customer_name",
-            # Money
+            # Money — total_amount_cents includes IVA (Spanish B2C all-in
+            # prices). subtotal_cents + iva_cents break that out for the
+            # summary card and invoicing.
             "total_amount_cents",
             "total_eur",
+            "subtotal_cents",
+            "subtotal_eur",
+            "iva_cents",
+            "iva_eur",
             "currency",
             "stripe_payment_intent_id",
             # Files
@@ -118,6 +131,10 @@ class OrderSerializer(serializers.ModelSerializer):
             "customer_name",
             "total_amount_cents",
             "total_eur",
+            "subtotal_cents",
+            "subtotal_eur",
+            "iva_cents",
+            "iva_eur",
             "currency",
             "stripe_payment_intent_id",
             "files",
@@ -133,6 +150,22 @@ class OrderSerializer(serializers.ModelSerializer):
 
     def get_total_eur(self, obj) -> str:
         return f"{obj.total_amount_cents / 100:.2f}"
+
+    def get_subtotal_cents(self, obj) -> int:
+        from .services import subtotal_cents_of
+        return subtotal_cents_of(obj.total_amount_cents)
+
+    def get_iva_cents(self, obj) -> int:
+        from .services import iva_cents_of
+        return iva_cents_of(obj.total_amount_cents)
+
+    def get_subtotal_eur(self, obj) -> str:
+        from .services import subtotal_cents_of
+        return f"{subtotal_cents_of(obj.total_amount_cents) / 100:.2f}"
+
+    def get_iva_eur(self, obj) -> str:
+        from .services import iva_cents_of
+        return f"{iva_cents_of(obj.total_amount_cents) / 100:.2f}"
 
     def get_customer_email(self, obj) -> str:
         return obj.created_by.email if obj.created_by else ""

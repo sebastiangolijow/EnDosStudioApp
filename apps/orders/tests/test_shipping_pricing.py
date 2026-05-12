@@ -25,7 +25,9 @@ GOLD_KWARGS = dict(
     height_mm=100,
     quantity=100,
 )
-GOLD_BASELINE_CENTS = 5951
+# Gold-standard: vinilo_blanco 10×10 cm × q=100 → pre-IVA 5951 cents,
+# all-in 5951 × 1.21 = 7200.71 → 7201 cents.
+GOLD_BASELINE_CENTS = 7201
 
 
 class ShippingMultiplierTests(BaseTestCase):
@@ -36,18 +38,21 @@ class ShippingMultiplierTests(BaseTestCase):
         self.assertEqual(cents, GOLD_BASELINE_CENTS)
 
     def test_express_adds_20_percent(self):
-        # 5951.25 × 1.20 = 7141.5 → 7142 cents
+        # pre-IVA: 5951.25 × 1.20 = 7141.5 → 7142
+        # all-in:  7142 × 1.21 = 8641.82 → 8642
         cents = compute_total_cents(**GOLD_KWARGS, shipping_method="express")
-        self.assertEqual(cents, 7142)
+        self.assertEqual(cents, 8642)
 
     def test_flash_adds_60_percent(self):
-        # 5951.25 × 1.60 = 9522 cents
+        # pre-IVA: 5951.25 × 1.60 = 9522
+        # all-in:  9522 × 1.21 = 11521.62 → 11522
         cents = compute_total_cents(**GOLD_KWARGS, shipping_method="flash")
-        self.assertEqual(cents, 9522)
+        self.assertEqual(cents, 11522)
 
     def test_shipping_stacks_with_existing_addons(self):
         # All toggles on + flash: 1 + 0.35 + 0.35 + 0.20 + 0.20 + 0.60 = 2.70x
-        # 5951.25 × 2.70 = 16068.375 → 16068 cents
+        # pre-IVA: 5951.25 × 2.70 = 16068.375 → 16068
+        # all-in:  16068 × 1.21 = 19442.28 → 19442
         cents = compute_total_cents(
             **GOLD_KWARGS,
             with_relief=True,
@@ -56,7 +61,7 @@ class ShippingMultiplierTests(BaseTestCase):
             with_barniz_opaco=True,
             shipping_method="flash",
         )
-        self.assertEqual(cents, 16068)
+        self.assertEqual(cents, 19442)
 
     def test_unknown_shipping_method_raises(self):
         with self.assertRaises(InvalidPricingInput):
@@ -124,8 +129,12 @@ class ShippingMethodAPITests(BaseTestCase):
             },
         )
         self.assertEqual(res.status_code, 200)
-        # 7142 cents == 71.42 €
-        self.assertEqual(res.data["total_amount_cents"], 7142)
+        # express + IVA: 7142 × 1.21 = 8641.82 → 8642 cents (86.42 €).
+        self.assertEqual(res.data["total_amount_cents"], 8642)
+        # IVA breakdown returned alongside total. Subtotal = total / 1.21.
+        # 8642 / 1.21 = 7142.149… → 7142; IVA = 8642 − 7142 = 1500.
+        self.assertEqual(res.data["subtotal_cents"], 7142)
+        self.assertEqual(res.data["iva_cents"], 1500)
 
 
 class ShippingContactTests(BaseTestCase):
