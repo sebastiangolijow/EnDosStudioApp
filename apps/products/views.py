@@ -43,6 +43,17 @@ class ProductViewSet(viewsets.ModelViewSet):
         qs = Product.objects.all()
         if not _is_staff(self.request.user):
             qs = qs.filter(is_active=True)
+        # Staff can opt into the public view via ?is_active=true so the
+        # /catalogo page shows them exactly what customers see. Without
+        # this, the shop owner flipping a product to hidden has no
+        # visible effect on /catalogo (their staff role bypasses the
+        # filter above), which makes the toggle feel broken.
+        is_active_param = self.request.query_params.get("is_active")
+        if is_active_param is not None:
+            if is_active_param.lower() in {"true", "1", "yes"}:
+                qs = qs.filter(is_active=True)
+            elif is_active_param.lower() in {"false", "0", "no"}:
+                qs = qs.filter(is_active=False)
         return qs
 
     def get_serializer_class(self):
