@@ -21,7 +21,8 @@ Endpoint surface:
   POST   /api/v1/orders/{uuid}/files/     upload OrderFile (multipart)
   DELETE /api/v1/orders/{uuid}/files/{file_uuid}/  remove OrderFile
 
-  POST   /api/v1/orders/{uuid}/smart-cut/ AI background-removal cut polygon
+  POST   /api/v1/orders/{uuid}/smart-cut/ AI background-removal cut polygon (authed)
+  POST   /api/v1/orders/smart-cut/        anonymous smart-cut (rate-limited, multipart)
 
   GET    /api/v1/orders/quote/            price preview, no order needed
 """
@@ -31,8 +32,10 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
 from apps.payments.services import StripeService
@@ -64,6 +67,7 @@ from .services_smart_cut import (
     NoOriginalFile,
     SmartCutModelUnavailable,
     smart_cut_for_order,
+    smart_cut_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -566,3 +570,92 @@ class PriceQuoteView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class _SmartCutAnonThrottle(AnonRateThrottle):
+    """Per-IP rate limit for the anonymous smart-cut endpoint.
+
+    Rate comes from settings.REST_FRAMEWORK.DEFAULT_THROTTLE_RATES
+    keyed on `scope = 'smart_cut_anon'`. Default: 5/hour (see base.py).
+    Authenticated callers use OrderViewSet.smart_cut and bypass this.
+    """
+    scope = "smart_cut_anon"
+
+
+class AnonymousSmartCutView(APIView):
+    """POST /api/v1/orders/smart-cut/ (anonymous, multipart)
+
+    Stateless rembg cut-line detection for the editor's "try before you
+    sign up" flow. Customer drops an image, runs smart-cut, sees the
+    result — no Order, no DB row, no authentication. When they hit
+    'Material y tamaño' the frontend auth-walls them.
+
+    Request:
+        multipart/form-data
+          file: PNG/JPG/WebP (the artwork)
+          margin_mm: int, optional (default 15, floored at MIN_MARGIN_MM=5)
+          smoothness: int 1-10, optional (default 5)
+
+    Response: same SmartCutResponse shape as the authenticated endpoint.
+
+    Throttling: 5 requests per IP per hour. Authenticated users should
+    use OrderViewSet.smart_cut (no throttle).
+    """
+
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser]
+    throttle_classes = [_SmartCutAnonThrottle]
+
+    # Don't waste rembg time on uploads that exceed the frontend's 25MB
+    # validation. A 30MB ceiling matches nginx client_max_body_size.
+    MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+
+    def post(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response(
+                {"detail": "file field is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if upload.size > self.MAX_UPLOAD_BYTES:
+            return Response(
+                {"detail": "File too large. Max 25 MB."},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        try:
+            margin_mm = int(request.data.get("margin_mm", 15))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "margin_mm must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            smoothness = int(request.data.get("smoothness", 5))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "smoothness must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        raw_bytes = upload.read()
+        try:
+            result = smart_cut_from_bytes(
+                raw_bytes,
+                margin_mm=margin_mm,
+                smoothness=smoothness,
+                log_context="anonymous",
+            )
+        except SmartCutModelUnavailable as exc:
+            logger.exception("Anonymous smart-cut model unavailable")
+            return Response(
+                {"detail": f"Smart cut unavailable: {exc}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as exc:
+            # Bad image format, decode failure, etc. Don't 500 — give the
+            # customer a clean retryable error.
+            logger.exception("Anonymous smart-cut failed: %s", exc)
+            return Response(
+                {"detail": "No pudimos procesar la imagen. Probá con otra."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(result, status=status.HTTP_200_OK)

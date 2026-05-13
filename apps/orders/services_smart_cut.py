@@ -259,55 +259,38 @@ def _sigma_for_smoothness(smoothness_1_to_10: int) -> float:
     return _SMOOTH_SIGMA_MIN + (s - 1) * (_SMOOTH_SIGMA_MAX - _SMOOTH_SIGMA_MIN) / 9.0
 
 
-def _px_per_mm_for_image(order: Order, image_width_px: int) -> float:
-    """Convert millimeters → image-natural pixels.
-
-    Mirrors the frontend's `pxPerMm` computation in EditorView.vue. When
-    the customer has already chosen `width_mm` on /order-config, we know
-    the print scale exactly; otherwise we assume the long edge prints at
-    100 mm (typical sticker size). The frontend uses the same fallback,
-    so the bleed margin painted on the canvas matches the dilation here.
-    """
-    DEFAULT_LONG_EDGE_MM = 100.0
-    if order.width_mm and order.width_mm > 0:
-        return image_width_px / float(order.width_mm)
-    return image_width_px / DEFAULT_LONG_EDGE_MM
-
-
-def smart_cut_for_order(
-    order: Order, margin_mm: int = 15, smoothness: int = _SMOOTH_DEFAULT
+def smart_cut_from_bytes(
+    raw_bytes: bytes,
+    *,
+    margin_mm: int = 15,
+    smoothness: int = _SMOOTH_DEFAULT,
+    width_mm: float | None = None,
+    log_context: str = "anonymous",
 ) -> dict:
-    """Run AI background removal on the order's original image.
+    """Run AI background removal on an in-memory image.
+
+    The Order-bound path delegates here. This function is also the entry
+    point for the anonymous smart-cut endpoint (logged-out customers
+    playing in the editor before they create an account).
 
     Args:
-        order: the Order (must have an `original` OrderFile).
+        raw_bytes: image file content (PNG/JPG/WebP). Anything PIL can open.
         margin_mm: bleed margin to add around the detected silhouette.
             Clamped to MIN_MARGIN_MM = 5 (printable minimum). Default 15
             matches the frontend's slider default.
-        smoothness: 1-10 slider value controlling how aggressively the
-            cut line rounds sharp concavities (fur, hair, decoration
-            spikes). Default 5 produces a cut line a typical vinyl
-            plotter can physically follow. 1 = follow silhouette tightly
-            (may be uncuttable on detailed art); 10 = very rounded.
+        smoothness: 1-10 slider value (see smart_cut_for_order).
+        width_mm: optional print width in mm. When known (Order.width_mm),
+            margin → px conversion is exact. When unknown (anonymous mode
+            before /order-config), falls back to the same 100 mm default
+            the frontend's pxPerMm computation uses.
+        log_context: identifier inserted into the perf-timing log line
+            (Order.uuid for authed calls, "anonymous" otherwise).
 
-    Returns a JSON-serializable dict matching the frontend's
-    SmartCutResponse type:
+    Returns the SmartCutResponse dict (same shape as smart_cut_for_order).
 
-        {"kind": "ok",
-         "points":          [...inflated cut polygon...],     # bleed-out
-         "artwork_points":  [...tight artwork silhouette...], # no bleed
-         "area_px": float,
-         "cleaned_image_data_url": "data:image/png;base64,..."}
-
-    or {"kind": "no-contour-found", ...} if rembg returned an empty mask.
-
-    Raises NoOriginalFile or SmartCutModelUnavailable on the documented
-    error paths; the view layer translates those to 400 / 503.
+    Raises SmartCutModelUnavailable on rembg load/inference failure.
+    Does NOT raise NoOriginalFile — caller passes bytes directly.
     """
-    file_obj = order.files.filter(kind="original").first()
-    if file_obj is None:
-        raise NoOriginalFile(f"Order {order.uuid} has no 'original' file.")
-
     # Floor the margin at the printable minimum. Above this, no cap —
     # the slider's max is enforced on the frontend.
     margin_mm = max(MIN_MARGIN_MM, int(margin_mm))
@@ -322,8 +305,6 @@ def smart_cut_for_order(
     # rembg expects a PIL Image (or bytes). RGB strip avoids edge cases
     # where the source already has an alpha channel — we want the model
     # to redo the foreground decision from RGB alone.
-    with file_obj.file.open("rb") as f:
-        raw_bytes = f.read()
     pil_in = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     timings["read_decode"] = time.perf_counter() - t0
 
@@ -389,7 +370,14 @@ def smart_cut_for_order(
     # === Step B: bleed-margin dilation (scipy) ===
     # margin_mm → natural-resolution px → downsampled px so the dilation
     # iterations match the customer's intent in physical millimeters.
-    px_per_mm_natural = _px_per_mm_for_image(order, natural_w)
+    # width_mm is known when the customer's already picked a print size
+    # (Order.width_mm); falls back to the 100 mm default used by the
+    # frontend's pxPerMm computation when not.
+    DEFAULT_LONG_EDGE_MM = 100.0
+    effective_width_mm = (
+        float(width_mm) if width_mm and width_mm > 0 else DEFAULT_LONG_EDGE_MM
+    )
+    px_per_mm_natural = natural_w / effective_width_mm
     margin_px_natural = int(round(margin_mm * px_per_mm_natural))
     margin_px_proc = max(1, int(round(margin_px_natural * scale)))
 
@@ -486,8 +474,8 @@ def smart_cut_for_order(
 
     timings["total"] = time.perf_counter() - t0
     logger.info(
-        "smart_cut order=%s margin_mm=%s smoothness=%s natural=%sx%s proc=%sx%s timings=%s",
-        order.uuid,
+        "smart_cut ctx=%s margin_mm=%s smoothness=%s natural=%sx%s proc=%sx%s timings=%s",
+        log_context,
         margin_mm,
         smoothness,
         natural_w,
@@ -506,8 +494,34 @@ def smart_cut_for_order(
     }
 
 
+def smart_cut_for_order(
+    order: Order, margin_mm: int = 15, smoothness: int = _SMOOTH_DEFAULT
+) -> dict:
+    """Thin wrapper around smart_cut_from_bytes for the order-bound view.
+
+    Loads the original file from the order's storage, then delegates. Use
+    smart_cut_from_bytes directly when there's no Order yet (anonymous
+    editor sessions before account creation).
+
+    Raises NoOriginalFile if the order has no `original` OrderFile.
+    """
+    file_obj = order.files.filter(kind="original").first()
+    if file_obj is None:
+        raise NoOriginalFile(f"Order {order.uuid} has no 'original' file.")
+    with file_obj.file.open("rb") as f:
+        raw_bytes = f.read()
+    return smart_cut_from_bytes(
+        raw_bytes,
+        margin_mm=margin_mm,
+        smoothness=smoothness,
+        width_mm=order.width_mm,
+        log_context=f"order={order.uuid}",
+    )
+
+
 __all__ = (
     "smart_cut_for_order",
+    "smart_cut_from_bytes",
     "NoOriginalFile",
     "SmartCutModelUnavailable",
     "MIN_MARGIN_MM",

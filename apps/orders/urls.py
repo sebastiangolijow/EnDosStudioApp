@@ -2,7 +2,12 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from .views import OrderFileViewSet, OrderViewSet, PriceQuoteView
+from .views import (
+    AnonymousSmartCutView,
+    OrderFileViewSet,
+    OrderViewSet,
+    PriceQuoteView,
+)
 
 router = DefaultRouter()
 router.register(r"", OrderViewSet, basename="order")
@@ -13,9 +18,14 @@ order_file_list = OrderFileViewSet.as_view({"get": "list", "post": "create"})
 order_file_detail = OrderFileViewSet.as_view({"get": "retrieve", "delete": "destroy"})
 
 urlpatterns = [
-    # /api/v1/orders/quote/ must come BEFORE the router so the router doesn't
-    # try to match "quote" as a UUID lookup.
+    # Non-UUID paths must come BEFORE the router so it doesn't try to
+    # match them as <uuid:pk> lookups on OrderViewSet.
     path("quote/", PriceQuoteView.as_view(), name="order-quote"),
+    path(
+        "smart-cut/",
+        AnonymousSmartCutView.as_view(),
+        name="order-smart-cut-anon",
+    ),
     path(
         "<uuid:order_pk>/files/",
         order_file_list,

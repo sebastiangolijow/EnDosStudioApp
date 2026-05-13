@@ -152,6 +152,13 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ),
+    # Throttle rates. No global DEFAULT_THROTTLE_CLASSES — individual
+    # views opt in via throttle_classes. Today only the anonymous
+    # smart-cut endpoint throttles ('smart_cut_anon' scope). Add more
+    # scopes here as we expose more anon endpoints with rembg-style costs.
+    "DEFAULT_THROTTLE_RATES": {
+        "smart_cut_anon": "5/hour",
+    },
 }
 
 SIMPLE_JWT = {
