@@ -13,6 +13,7 @@ urlpatterns = [
         "api/v1/",
         include(
             [
+                path("", include("apps.core.urls")),
                 path("auth/", include("apps.users.auth_urls")),
                 path("users/", include("apps.users.urls")),
                 path("orders/", include("apps.orders.urls")),

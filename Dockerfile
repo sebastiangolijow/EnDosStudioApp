@@ -39,8 +39,13 @@ RUN groupadd -r app && useradd -r -g app -d /app app \
 
 COPY --chown=app:app . .
 
+# Migrate + collectstatic run on container start, then exec the CMD.
+# Dev compose overrides the CMD with `runserver` and the entrypoint still works.
+RUN chmod +x /app/entrypoint.sh
+
 USER app
 
 EXPOSE 8000
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
