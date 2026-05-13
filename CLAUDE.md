@@ -2,7 +2,7 @@
 
 > **Studio**: YeKo Studio · **Client**: a print shop in Barcelona that sells custom stickers
 > **Stack**: Python 3.11 · Django 4.2 · DRF · PostgreSQL 15 · Docker · Stripe · (Celery only if real async need)
-> **Status (EOD 2026-05-12)**: M1 + M2 + M3 shipped — orders / payments / catalog / smart-cut / cut-path SVG / shape field + Oval / shipping_method + IVA pricing / shipping contact fields + admin force-status with shipping email / customer order-received emails / owner new-order email / **reservations with whitelist** (in-store pickup, Order.pickup_at) / **discounts** (Discount model + apply-discount endpoint + pricing pipeline) / product sale_price + weight_grams + category / public catalog respects ?is_active=true. 187 backend tests passing. Live Stripe keys + production SMTP + first deploy remain the operational blockers.
+> **Status (2026-05-13)**: 🟢 **LIVE at https://endosestudio.com** — Hostinger KVM VPS (Ubuntu 24.04, Frankfurt, IP `187.124.29.215`), docker compose (db + web + nginx), Let's Encrypt TLS, Gmail SMTP (verification emails arrive <30s), rembg warmed at boot. Stripe live keys + webhook secret loaded; cuenta cliente en KYC review hasta ~2026-05-14 (`charges_enabled=False` until then). Frontend admin user `endosestudio@gmail.com` (role=admin) created server-side via `manage.py createsuperuser` + shell promotion. **Added today (2026-05-13)**: `entrypoint.sh` (migrate + collectstatic on boot), `/api/v1/health/` (apps/core), `.env.production.template`, **anonymous smart-cut endpoint** `POST /api/v1/orders/smart-cut/` (multipart, `AnonRateThrottle` scope `smart_cut_anon` @ 5/hour, `AllowAny`). Refactored `services_smart_cut` — extracted `smart_cut_from_bytes(raw_bytes, ...)` as shared core; `smart_cut_for_order` is now a thin file-loading wrapper. 187 backend tests passing.
 
 This file is the index for any AI agent working in this repo. Read it before doing anything. It captures the Yeko Studio mindset, the project spec digest, the conventions we'll follow, and the open questions still to resolve.
 
@@ -178,12 +178,16 @@ No `analytics/` app on day 1 — admin views + Postgres queries cover it for an 
 
 ## 🚧 Status
 
-### Pick up here tomorrow (EOD 2026-05-12)
+### Pick up here (2026-05-13)
 
-**No open thread — session ended green.** 187 backend tests passing
-(0 failures, 0 errors). Everything pushed to `main`. The remaining
-operational blockers (real Stripe keys, prod SMTP creds, first deploy)
-are configuration tasks, not code.
+**🟢 LIVE.** Deployed to Hostinger VPS at https://endosestudio.com. Stripe live keys + webhook secret loaded; cliente en KYC review hasta ~2026-05-14 — once approved, real payments flow end-to-end. All other blockers from the EOD-2026-05-12 list are resolved.
+
+**Today's additions** (already on `main`):
+- `entrypoint.sh` runs migrate + collectstatic on every web container boot
+- `/api/v1/health/` endpoint under `apps.core` (used by docker compose healthcheck)
+- `.env.production.template` with every prod-only env var documented
+- Anonymous smart-cut endpoint `POST /api/v1/orders/smart-cut/` (multipart, no auth) — frontend uses it for the "try the editor before sign up" mode. Rate-limited 5/hour/IP via `AnonRateThrottle` scope `smart_cut_anon` (rate in `settings.REST_FRAMEWORK.DEFAULT_THROTTLE_RATES`). Authenticated users keep using `OrderViewSet.smart_cut` to bypass the throttle.
+- Refactored `apps/orders/services_smart_cut.py` — extracted `smart_cut_from_bytes(raw_bytes, ...)` as the shared core. `smart_cut_for_order(order, ...)` is now a thin file-loading wrapper. Dropped `_px_per_mm_for_image` (inlined; was a one-caller helper).
 
 If picking up next:
 - **Cut-path SVG download in admin UI** — file is already generated
